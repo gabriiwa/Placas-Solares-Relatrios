@@ -5,7 +5,7 @@ on:
     # 10:00 UTC = 07:00 em Brasília (o Brasil não tem mais horário de verão).
     # O agendador do GitHub costuma atrasar de 5 a 20 min em horários cheios;
     # se precisar de pontualidade, troque para "45 9 * * *".
-    - cron: "0 10 * * *"
+    - cron: "0 1 * * *"
   workflow_dispatch:
     inputs:
       comando:
