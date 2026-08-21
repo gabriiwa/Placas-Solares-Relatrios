@@ -169,6 +169,13 @@ class Handler(BaseHTTPRequestHandler):
             u = next((x for x in USINAS if str(x["plantId"]) == pid), None)
             if not u:
                 return self._responder({"code": "AWX-4040", "msg": "usina inexistente"}, 200)
+            # MOCK_SERIE permite ensaiar os desfechos ruins do card:
+            #   ok (padrão) | ruim (formato irreconhecível) | erro (API recusa)
+            modo = os.environ.get("MOCK_SERIE", "ok")
+            if modo == "erro":
+                return self._responder({"code": "AWX-5003", "msg": "sem permissão de convidado"}, 200)
+            if modo == "ruim":
+                return self._responder(envelope({"plantId": u["plantId"], "resumo": "sem série"}))
             return self._responder(envelope({"plantId": u["plantId"], "dataList": serie_mensal(u)}))
 
         if p == "/prod-api/analysis/alarm/list":

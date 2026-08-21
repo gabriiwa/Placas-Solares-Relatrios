@@ -71,7 +71,10 @@ LANG = os.environ.get("AUXSOL_LANG", "pt_BR").strip() or "pt_BR"
 PLANT_IDS = [p.strip() for p in os.environ.get("PLANT_IDS", "").split(",") if p.strip()]
 GCHAT_WEBHOOK_URL = os.environ.get("GCHAT_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip()
+# Atenção ao padrão: o workflow passa `vars.GEMINI_MODEL` sempre, então a
+# variável EXISTE vazia quando a Variable não foi criada — e nesse caso o
+# default do os.environ.get não vale. O `or` é que garante o padrão.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-flash-latest"
 DRY_RUN = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
 DEBUG = os.environ.get("DEBUG", "").strip() in ("1", "true", "yes")
 KWH_POR_KWP_ESPERADO = float(os.environ.get("KWH_POR_KWP_ESPERADO", "4.2") or 4.2)
@@ -535,24 +538,39 @@ def casa_dia(rotulo: str, dia: date) -> bool:
     return len(r.strip()) <= 2 and so_digitos == str(dia.day)
 
 
-def geracao_do_dia(api: "Auxsol", pid: str, dia: date) -> tuple[float | None, str]:
-    """kWh gerados no dia `dia`, buscados na série do mês. (valor, origem)."""
+def geracao_do_dia(api: "Auxsol", pid: str, dia: date) -> tuple[float | None, str, str]:
+    """
+    kWh gerados no dia `dia`, buscados na série do mês.
+    Devolve (valor, origem, diagnóstico). O diagnóstico explica POR QUE falhou —
+    "não veio" é inútil para depurar, e o JSON cru vai para o log sem depender
+    de ninguém lembrar de marcar a caixinha de debug.
+    """
     if not pid:
-        return None, ""
+        return None, "", "usina sem plantId"
+
     try:
         rel = api.relatorio_usina(pid, tipo=2, data=dia.strftime("%Y-%m-%d"))
     except Exception as e:
-        dbg(f"série mensal da usina {pid} falhou: {e}")
-        return None, ""
-    if DEBUG:
-        dbg(f"série crua da usina {pid}: {json.dumps(rel, ensure_ascii=False)[:1200]}")
+        return None, "", f"a API recusou a série mensal ({' '.join(str(e).split())[:120]})"
+
     serie = extrair_serie(rel)
+    if not serie:
+        log(
+            f"::warning::série da usina {pid} em formato não reconhecido. "
+            f"JSON cru: {json.dumps(rel, ensure_ascii=False)[:1500]}"
+        )
+        return None, "", "a série mensal veio em formato não reconhecido (JSON cru no log)"
+
     for rotulo, valor in serie:
         if casa_dia(rotulo, dia):
-            return valor, "série mensal da API"
-    if serie:
-        dbg(f"série da usina {pid} não tem {dia.isoformat()}; rótulos: {[r for r, _ in serie][:8]}")
-    return None, ""
+            return valor, "série mensal da API", ""
+
+    rotulos = [str(r) for r, _ in serie][:10]
+    log(
+        f"::warning::série da usina {pid} não contém {dia.isoformat()}. "
+        f"Rótulos encontrados: {rotulos}"
+    )
+    return None, "", f"a série mensal não traz {dia.strftime('%d/%m')} (rótulos: {', '.join(rotulos[:4])})"
 
 
 def analisar_usina(
@@ -678,7 +696,10 @@ def comentario_ia(analises: list[dict]) -> str:
         esperado=KWH_POR_KWP_ESPERADO, dados=json.dumps(resumo, ensure_ascii=False, indent=1)
     )
 
-    modelos = list(dict.fromkeys([GEMINI_MODEL, "gemini-flash-latest", "gemini-2.0-flash"]))
+    # o filter(None) evita tentar um modelo vazio se a variável vier em branco
+    modelos = list(
+        dict.fromkeys(filter(None, [GEMINI_MODEL, "gemini-flash-latest", "gemini-2.0-flash"]))
+    )
     for modelo in modelos:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -697,7 +718,13 @@ def comentario_ia(analises: list[dict]) -> str:
             texto = pegar(payload, ["text"])
             if texto:
                 return " ".join(str(texto).split())
-        log(f"aviso: Gemini ({modelo}) respondeu HTTP {status} — segue sem comentário da IA")
+        # a mensagem da própria API é o diagnóstico; só o status não diz nada
+        motivo = _msg(payload) if isinstance(payload, dict) else str(payload)[:180]
+        log(
+            f"aviso: Gemini ({modelo}) respondeu HTTP {status}: "
+            f"{' '.join(str(motivo).split())[:200]}"
+        )
+    log("aviso: card segue sem o comentário da IA. Rode 'testar-gemini' para diagnosticar.")
     return ""
 
 
@@ -713,7 +740,14 @@ def fmt(v: float | None, sufixo: str = "", casas: int = 1) -> str:
     return f"{s}{sufixo}"
 
 
-def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: date) -> dict:
+def montar_card(
+    analises: list[dict],
+    comentario: str,
+    avisos: list[str],
+    dia: date,
+    periodo: str = "",
+    subtitulo: str = "",
+) -> dict:
     total_dia = sum(a["kwh_dia"] or 0 for a in analises)
     total_kwp = sum(a["kwp"] or 0 for a in analises)
     total_rs = sum(a["economia_rs"] or 0 for a in analises)
@@ -724,6 +758,8 @@ def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: d
         titulo_icone = "🔴"
     elif any(a["icone"] == "🟡" for a in analises):
         titulo_icone = "🟡"
+    elif all(a["icone"] == "⏳" for a in analises):
+        titulo_icone = "⏳"
     else:
         titulo_icone = "🟢"
 
@@ -732,7 +768,8 @@ def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: d
             "widgets": [
                 {
                     "decoratedText": {
-                        "topLabel": f"Geração em {dia.strftime('%d/%m')} — {len(analises)} usina(s)",
+                        "topLabel": (periodo or f"Geração em {dia.strftime('%d/%m')}")
+                        + f" — {len(analises)} usina(s)",
                         "text": f"<b>{fmt(total_dia, ' kWh')}</b>"
                         + (f"  ·  <b>R$ {fmt(total_rs)}</b>" if total_rs else ""),
                         "bottomLabel": f"{fmt(rend_geral, ' kWh/kWp', 2)} · "
@@ -756,9 +793,16 @@ def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: d
         linhas = [
             {
                 "decoratedText": {
-                    "topLabel": dia.strftime("%d/%m"),
+                    "topLabel": (a.get("data_numero") or dia).strftime("%d/%m")
+                    + (" (parcial)" if a.get("parcial") else ""),
                     "text": f"<b>{fmt(a['kwh_dia'], ' kWh')}</b>  ·  {fmt(a['kwh_por_kwp'], ' kWh/kWp', 2)}",
-                    "bottomLabel": a["rotulo"]
+                    "bottomLabel": (
+                        # num dia em curso a comparação com o esperado ainda não
+                        # fechou: dizer "abaixo do esperado" seria precipitado
+                        f"parcial — {a['rotulo']} até agora"
+                        if a.get("parcial")
+                        else a["rotulo"]
+                    )
                     + (f" · {a['origem_dia']}" if a.get("origem_dia") else ""),
                 }
             },
@@ -796,17 +840,17 @@ def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: d
         secoes.append(
             {
                 "header": f"{a['icone']} {a['nome']}",
-                "collapsible": False,
                 "widgets": linhas,
             }
         )
 
     if avisos:
+        # Sem `collapsible`: no Google Chat, expandir uma seção de card postado
+        # por webhook dispara um evento de interação que webhook não sabe
+        # responder — e o Chat exibe "Webhook Bot não processou sua solicitação".
         secoes.append(
             {
                 "header": "Avisos da coleta",
-                "collapsible": True,
-                "uncollapsibleWidgetsCount": 0,
                 "widgets": [{"textParagraph": {"text": "• " + "<br>• ".join(avisos)}}],
             }
         )
@@ -818,7 +862,7 @@ def montar_card(analises: list[dict], comentario: str, avisos: list[str], dia: d
                 "card": {
                     "header": {
                         "title": f"{titulo_icone} Relatório solar diário",
-                        "subtitle": dia.strftime("%d/%m/%Y") + " · Nansen Solar / AUXSOL",
+                        "subtitle": subtitulo or (dia.strftime("%d/%m/%Y") + " · Nansen Solar"),
                     },
                     "sections": secoes,
                 },
@@ -1092,40 +1136,120 @@ def cmd_relatorio() -> int:
             except Exception as e:
                 avisos.append(f"sem dados em tempo real da usina {pid}: {e}")
 
-        kwh_ontem, origem = geracao_do_dia(api, pid, dia_ref)
+        kwh_ontem, origem, diagnostico = geracao_do_dia(api, pid, dia_ref)
         a = analisar_usina(u, detalhe, alarmes, cap_cfg, kwh_dia_forcado=kwh_ontem)
         a["origem_dia"] = origem
+        a["parcial"] = False
+        a["data_numero"] = dia_ref
 
         if kwh_ontem is None:
             if a["kwh_dia"] is not None:
-                a["origem_dia"] = "acumulado de hoje (a série de ontem não veio)"
-                avisos.append(
-                    f"{a['nome']}: a geração de {dia_ref.strftime('%d/%m')} não veio na série "
-                    "mensal; o número mostrado é o acumulado de hoje."
-                )
+                # Cai para o acumulado de HOJE — que é de outro dia e ainda por
+                # fechar. O rótulo tem de mudar junto com o número, senão o card
+                # anuncia ontem e mostra hoje.
+                a["parcial"] = True
+                a["data_numero"] = agora().date()
+                a["origem_dia"] = f"parcial, até {agora().strftime('%H:%M')}"
+                # Um dia em curso NÃO se compara com a expectativa de dia
+                # fechado: às 7h daria "sem geração" nas três usinas, todo dia.
+                # Alarme falso diário treina a equipe a ignorar o relatório.
+                a["rotulo"] = "dia em curso, ainda sem julgar"
+                a["icone"] = "🔴" if a["alarmes"] else "⏳"
+                avisos.append(f"{a['nome']}: {diagnostico}. Mostrando o parcial de hoje.")
             else:
-                avisos.append(
-                    f"{a['nome']}: sem geração de {dia_ref.strftime('%d/%m')} e sem dado de hoje."
-                )
+                a["origem_dia"] = "sem dado"
+                avisos.append(f"{a['nome']}: {diagnostico}. Também não há dado de hoje.")
         analises.append(a)
 
     # problema primeiro: quem precisa de ação aparece no topo do card.
-    ordem_icone = {"🔴": 0, "🟡": 1, "❔": 2, "🟢": 3}
+    ordem_icone = {"🔴": 0, "🟡": 1, "⏳": 2, "❔": 3, "🟢": 4}
     analises.sort(key=lambda x: (ordem_icone.get(x["icone"], 9), sem_acento(x["nome"])))
     for a in analises:
         log(
-            f"{a['icone']} {a['nome']}: {dia_ref.strftime('%d/%m')}="
+            f"{a['icone']} {a['nome']}: "
+            f"{(a.get('data_numero') or dia_ref).strftime('%d/%m')}"
+            f"{' (parcial)' if a.get('parcial') else ''}="
             f"{fmt(a['kwh_dia'], ' kWh')} ({fmt(a['kwh_por_kwp'], ' kWh/kWp', 2)}) · "
             f"{a['rotulo']} · {len(a['alarmes'])} alarme(s)"
         )
+    for aviso in avisos:  # os avisos também no log, não só no card
+        log(f"::warning::{aviso}")
 
-    card = montar_card(analises, comentario_ia(analises), avisos, dia_ref)
+    # O título tem de descrever o que os números REALMENTE são.
+    parciais = [a for a in analises if a.get("parcial")]
+    if not parciais:
+        periodo = f"Geração em {dia_ref.strftime('%d/%m')}"
+        subtitulo = dia_ref.strftime("%d/%m/%Y") + " · dia fechado"
+    elif len(parciais) == len(analises):
+        hoje = agora()
+        periodo = f"Parcial de hoje até {hoje.strftime('%H:%M')}"
+        subtitulo = hoje.strftime("%d/%m/%Y") + " · DIA AINDA EM CURSO"
+    else:
+        periodo = "Geração — datas diferentes por usina"
+        subtitulo = f"{dia_ref.strftime('%d/%m/%Y')} · leia a data de cada usina"
+
+    card = montar_card(analises, comentario_ia(analises), avisos, dia_ref, periodo, subtitulo)
     enviar_chat(card)
     return 0
 
 
+def cmd_testar_gemini() -> int:
+    """Pergunta à própria API do Google quais modelos a chave pode usar."""
+    exigir("GEMINI_API_KEY")
+    chave = urllib.parse.quote(GEMINI_API_KEY)
+
+    status, payload = http(
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={chave}",
+        tentativas=2,
+    )
+    if status != 200:
+        log(f"listar modelos falhou — HTTP {status}: {' '.join(str(_msg(payload)).split())[:300]}")
+        log(
+            "\nLeitura:\n"
+            "  · 400/403  = chave inválida, revogada, ou sem a API habilitada\n"
+            "  · 404      = endpoint errado (não deveria acontecer)\n"
+            "  · HTTP 0   = a rede do runner não alcançou o Google\n"
+            "Gere uma chave nova em https://aistudio.google.com/apikey e "
+            "atualize o secret GEMINI_API_KEY."
+        )
+        return 1
+
+    modelos = _dados(payload) or []
+    uteis = []
+    for m in modelos if isinstance(modelos, list) else []:
+        nome = str(m.get("name", "")).replace("models/", "")
+        metodos = m.get("supportedGenerationMethods") or []
+        if "generateContent" in metodos:
+            uteis.append(nome)
+
+    log(f"a chave enxerga {len(uteis)} modelo(s) capaz(es) de generateContent:\n")
+    for nome in uteis:
+        log(f"    {nome}")
+
+    preferidos = [n for n in uteis if "flash" in n and "thinking" not in n]
+    escolhido = (preferidos or uteis or [""])[0]
+    if not escolhido:
+        log("\nNenhum modelo disponível para esta chave.")
+        return 1
+
+    log(f"\ntestando geração com '{escolhido}'…")
+    status, payload = http(
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{escolhido}:generateContent?key={chave}",
+        "POST",
+        corpo={"contents": [{"parts": [{"text": "Responda apenas: ok"}]}]},
+        tentativas=2,
+    )
+    if status == 200 and pegar(payload, ["text"]):
+        log(f"  ✅ funcionou. Cadastre a Variable GEMINI_MODEL={escolhido}")
+        return 0
+    log(f"  ❌ HTTP {status}: {' '.join(str(_msg(payload)).split())[:300]}")
+    return 1
+
+
 COMANDOS = {
     "relatorio": cmd_relatorio,
+    "testar-gemini": cmd_testar_gemini,
     "descobrir-url": cmd_descobrir_url,
     "listar-usinas": cmd_listar_usinas,
     "alarmes": cmd_alarmes,
