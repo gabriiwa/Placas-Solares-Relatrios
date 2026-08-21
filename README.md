@@ -1,198 +1,137 @@
 # Relatório solar diário — Nansen Solar / AUXSOL → Google Chat
 
-Todo dia às 7h (horário de Brasília) o GitHub Actions puxa a geração do dia
-anterior dos três postos na API da Nansen Solar (plataforma AUXSOL), avalia a
-eficiência, lê os alarmes ativos e manda um card para um espaço do Google Chat.
+Todo dia, no horário agendado, o GitHub Actions puxa a geração dos três postos na
+API da Nansen (plataforma AUXSOL), compara com o que se esperava para a época do
+ano, lê os alarmes ativos e manda um card para um espaço do Google Chat.
 
-Custo: zero. Roda no plano gratuito do GitHub Actions (~3 min/mês de uso) e usa
-só a biblioteca padrão do Python — não há `pip install`, não há
-`requirements.txt`, não há servidor para manter.
+Custo zero: roda no plano gratuito do GitHub Actions (uns 3 min/mês) e usa só a
+biblioteca padrão do Python — não há `pip install`, não há `requirements.txt`,
+não há servidor para manter.
 
 ## Arquivos
 
 | Arquivo | Para que serve |
 |---|---|
 | `main.py` | Todo o programa: cliente da API, cálculos, card, envio |
-| `.github/workflows/daily_report.yml` | O agendamento das 7h e a execução manual |
+| `.github/workflows/daily_report.yml` | O agendamento e a execução manual |
 | `mock_server.py` | API falsa, para testar sem credencial nenhuma |
-| `.env.example` | Referência das variáveis (não versione o `.env` real) |
+| `.env.example` | Referência das variáveis |
 
-## Por que a execução anterior falhou
+## Configuração
 
-Dois erros, os dois esperados nesse ponto:
-
-1. **`can't open file 'main.py': No such file or directory`** — o workflow
-   existia no repositório, mas o `main.py` não. O Actions subiu a máquina, fez o
-   checkout e não achou o script. Resolve-se comitando o `main.py` na **raiz** do
-   repositório (passo 1 abaixo).
-2. **`PLANT_ID` vazio** — os secrets ainda não estavam cadastrados. Só que
-   `PLANT_IDS` **não é obrigatório**: vazio significa "todas as usinas visíveis
-   para esta credencial", que é justamente o que queremos. O que é obrigatório é
-   `AUXSOL_BASE_URL`, `AUXSOL_APP_ID`, `AUXSOL_APP_SECRET` e
-   `GCHAT_WEBHOOK_URL`.
-
-## Passo 1 — subir os arquivos
-
-Na página do repositório: **Add file → Upload files**, arraste o `main.py`, o
-`mock_server.py` e o `README.md` para a raiz, e commite. O
-`.github/workflows/daily_report.yml` substitui o workflow que já está lá (mesmo
-caminho, mesmo nome de arquivo).
-
-Estrutura final:
-
-```
-main.py
-mock_server.py
-README.md
-.env.example
-.github/workflows/daily_report.yml
-```
-
-## Passo 2 — criar o webhook do espaço no Google Chat
-
-O webhook é o endereço para onde o card é enviado. Requer conta Google
-Workspace (o `@grupotrapezio.com.br` serve; conta `@gmail.com` pessoal não tem
-webhook de espaço).
-
-1. Abra o Google Chat e crie (ou escolha) o espaço que vai receber o relatório —
-   algo como "Solar — postos".
-2. Clique no **nome do espaço** no topo → **Apps e integrações**.
-3. **Webhooks** (ou "Gerenciar webhooks") → **Adicionar webhook**.
-4. Nome: `Relatório Solar`. Avatar: opcional.
-5. Copie a URL gerada. Ela começa com
-   `https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`
-
-Essa URL **é uma credencial**: quem tem ela consegue postar no espaço. Vai em
-Secret, nunca no código.
-
-> Se o item "Webhooks" não aparecer, o administrador do Workspace desativou
-> webhooks de entrada — é preciso pedir a liberação para o TI.
-
-## Passo 3 — cadastrar os secrets
-
-No repositório: **Settings → Secrets and variables → Actions**.
-
-Na aba **Secrets** (`New repository secret`), os quatro obrigatórios:
+**Secrets** (Settings → Secrets and variables → Actions → aba Secrets):
 
 | Secret | Valor |
 |---|---|
-| `AUXSOL_BASE_URL` | a URL base da API, ex. `https://www.auxsolcloud.com/prod-api` |
-| `AUXSOL_APP_ID` | `119348` (credencial da conta Beatriz Dias) |
-| `AUXSOL_APP_SECRET` | o app_secret da mesma credencial |
-| `GCHAT_WEBHOOK_URL` | a URL do passo 2 |
+| `AUXSOL_BASE_URL` | `https://eu.auxsolcloud.com/auxsol-api` |
+| `AUXSOL_APP_ID` | o app_id da credencial |
+| `AUXSOL_APP_SECRET` | o app_secret |
+| `GCHAT_WEBHOOK_URL` | webhook do espaço do Chat |
+| `GEMINI_API_KEY` | opcional — só para o comentário em linguagem natural |
 
-E o opcional:
+**Variables** (aba Variables, nada aqui é sigiloso):
 
-| Secret | Valor |
+| Variable | Quando usar |
 |---|---|
-| `GEMINI_API_KEY` | chave do Google AI Studio (`aistudio.google.com/apikey`) |
+| `PLANT_IDS` | não criar — vazio significa "todas as usinas da credencial" |
+| `CAPACIDADE_KWP` | **não criar** — a API informa a capacidade certa; um valor manual errado estragaria a avaliação |
+| `KWH_POR_KWP_ESPERADO` | só se quiser um esperado fixo, ignorando a sazonalidade |
+| `HORA_DIA_FECHADO` | hora local a partir da qual o dia é julgado (padrão 20) |
+| `GEMINI_MODEL` | se quiser fixar um modelo, ex. `gemini-flash-latest` |
 
-Sem `GEMINI_API_KEY` o card sai exatamente igual, só sem o parágrafo em
-linguagem natural. Todos os números vêm do Python, não da IA — a chave é um
-extra, não uma dependência.
+Para criar o webhook: Google Chat → o espaço → nome do espaço → **Apps e
+integrações** → **Webhooks** → **Adicionar webhook**. Copie a URL; ela é uma
+credencial (quem a tem posta no espaço), então vai em Secret.
 
-Na aba **Variables** (`New repository variable`), o que não é sigiloso:
+## Comandos
 
-| Variable | Valor sugerido |
+Pelo menu de **Run workflow**, no campo "Subcomando do main.py":
+
+| Comando | O que faz |
 |---|---|
-| `PLANT_IDS` | deixe **sem criar** por enquanto (vazio = todas as usinas) |
-| `CAPACIDADE_KWP` | `Tijucas=60,Bairro Novo=60,Makiolka=60` |
-| `KWH_POR_KWP_ESPERADO` | `4.2` |
+| `relatorio` | o padrão: monta e envia o card |
+| `listar-usinas` | imprime plantId, nome e kWp de cada usina, e o JSON cru da primeira |
+| `alarmes` | imprime os alarmes crus |
+| `testar-webhook` | manda um card de teste ao Chat, sem tocar na API da Nansen |
+| `descobrir-url` | testa candidatos de `AUXSOL_BASE_URL`, se ela mudar |
+| `testar-gemini` | lista os modelos que a chave enxerga e testa um |
 
-## Passo 4 — descobrir a URL base (a pendência que ainda bloqueia)
+As caixas `dry_run` (imprime o card no log em vez de enviar) e `debug` (loga cada
+chamada) funcionam com qualquer comando.
 
-A documentação da AUXSOL não informa o host: diz para pedir ao suporte. Sem ele
-nada funciona. Três caminhos, do mais rápido ao mais lento:
-
-**a) Deixar o próprio Actions testar.** Cadastre `AUXSOL_APP_ID` e
-`AUXSOL_APP_SECRET`, ponha qualquer coisa em `AUXSOL_BASE_URL`, vá em **Actions →
-Relatório solar diário → Run workflow**, escolha o comando `descobrir-url` e
-rode. O log diz qual candidato autenticou.
-
-**b) Ler do navegador (o mais confiável).** Faça login na plataforma web da
-Nansen/AUXSOL, aperte `F12` → aba **Network** → filtro **Fetch/XHR** → recarregue
-a página. Clique em qualquer requisição da lista: a URL base é tudo o que vem
-antes de `/auth/` ou `/analysis/`. Exemplo: se aparecer
-`https://xxx.com/prod-api/analysis/plantReport/...`, a base é
-`https://xxx.com/prod-api`.
-
-**c) Pedir ao suporte da Nansen.** O e-mail enviado pediu documentação,
-autenticação e limites, mas não pediu a URL. Vale um follow-up curto:
-
-> Solicitamos também a **URL base (host) da API** para as chamadas — a
-> documentação indica que esse endereço deve ser obtido junto ao suporte.
-> Como exemplo do que precisamos: o endereço completo do endpoint `/auth/token`.
-> Aproveitando, existe ambiente de homologação? E o limite de 10 requisições
-> por 5 segundos por IP vale também para integrações de terceiros?
-
-## Passo 5 — conferir as usinas
-
-Com a URL base certa, rode o workflow manualmente com o comando
-`listar-usinas`. O log imprime `plantId`, nome e kWp de cada usina, o JSON cru da
-primeira (útil para conferir os nomes dos campos) e uma linha pronta para colar
-em `PLANT_IDS`.
-
-É aqui que se responde a dúvida em aberto do projeto: **se as três usinas
-aparecerem**, a credencial já cobre tudo e não é preciso esperar liberação
-nenhuma. Se aparecerem menos de três, os dataloggers estão sob outra conta e a
-liberação continua pendente.
-
-Dataloggers dos três postos, para conferência:
-
-| Posto | Datalogger SN | Inversor |
-|---|---|---|
-| Tijucas | A012311030084010 | ASN-60TL-LV |
-| Bairro Novo | A012311130984125 | ASN-60TL-LV |
-| Makiolka | A012311130950854 | ASN-60TL-LV |
-
-## Passo 6 — primeiro envio
-
-**Actions → Relatório solar diário → Run workflow**:
-
-- `comando: testar-webhook` — confirma que o card chega no espaço do Chat.
-- `comando: relatorio` + `dry_run: true` — monta o card de verdade e só imprime
-  no log, sem postar. Bom para revisar os números antes de mostrar para a equipe.
-- `comando: relatorio` — para valer.
-
-Depois disso o agendamento das 7h roda sozinho. Se algum dia falhar, o workflow
-posta um aviso no próprio espaço com o link do log.
+Se um comando não aparecer no menu, é porque a lista de opções está escrita no
+`.github/workflows/daily_report.yml` — acrescente a linha lá.
 
 ## O que o card mostra
 
-- **Resumo** — geração total do dia anterior, kWh por kWp e alarmes ativos.
-- **Leitura do dia** — 3 frases da IA, quando há `GEMINI_API_KEY`.
-- **Uma seção por usina**, com quem está com problema no topo:
-  - geração do dia e o rendimento em kWh/kWp;
-  - acumulado do mês e total, capacidade instalada, potência instantânea;
-  - cada alarme ativo, com nível e horário.
-- **Avisos da coleta** — seção recolhida, aparece quando algum dado não veio.
+Por usina, na ordem: geração do dia, **esperado e % atingido**, economia no dia,
+economia no mês, acumulados, e cada alarme ativo. As usinas com problema vêm no
+topo, e o título do card carrega o pior estado entre elas.
 
-O semáforo compara o rendimento do dia com `KWH_POR_KWP_ESPERADO`:
-🟢 acima de 75% do esperado, 🟡 entre 50% e 75%, 🔴 abaixo de 50%, sem geração,
-ou com alarme ativo.
+O semáforo compara a geração com o esperado do mês: 🟢 acima de 85%, 🟡 entre 60%
+e 85%, 🔴 abaixo de 60% ou sem geração, e 🔴 sempre que houver alarme ativo.
+⏳ significa "dia ainda em curso, não julgado".
 
-**Sobre o "dia":** o card das 7h fala do **dia anterior**, fechado. Às 7h a
-geração de hoje é praticamente zero e não diz nada. O número sai da série mensal
-da API; se ela não vier, o script cai no acumulado do dia atual e avisa isso na
-própria linha, para ninguém ler um número pela metade como se fosse o dia todo.
+### De onde vem o "esperado"
+
+Da irradiação típica da região de Curitiba, mês a mês (tabela `FORMA_MENSAL` no
+código), multiplicada por um rendimento de sistema de 0,80 e pela capacidade
+instalada. Por isso a meta de uma usina de 75 kWp é 198 kWh em junho e 324 kWh em
+dezembro — comparar o inverno com o verão faria o inverno parecer defeito.
+
+**Não** é o histórico da própria usina, de propósito. Uma usina que sempre gerou
+pouco tem histórico baixo e passaria a ser aprovada por comparação consigo mesma:
+a Makiolka gerou 765 kWh/kWp em 2025, quando um sistema saudável em Curitiba faz
+1.300–1.450, e contra o próprio histórico ela tirava 🟢 148%. O histórico aparece
+ao lado, como contexto ("média desta usina: 153 kWh"), não como meta.
+
+Os valores da tabela são típicos da região, não medidos no telhado. Depois de
+alguns meses de dados reais vale calibrá-los.
+
+### Sobre a economia em R$
+
+Vem da tarifa cadastrada na própria plataforma (`tariff.fixPrice`, hoje
+R$ 0,87/kWh) multiplicada pela geração. É um **teto**: vale cheio para o kWh
+autoconsumido, que evita compra na tarifa cheia, mas o excedente injetado gera
+crédito que, pela Lei 14.300/2022, não compensa 100% da TUSD e vale menos. Para
+posto de combustível o autoconsumo é alto (carga no horário comercial coincide
+com a geração), então o teto fica perto do real — mas não é o real. Conferir os
+R$ 0,87 contra uma fatura.
+
+A economia no mês é a mais útil das duas: é o número que se compara com a parcela
+do financiamento, e sai de `monthlyYield`, que a API entrega de forma confiável.
+
+### Sobre o dia e o horário
+
+O relatório fala do **dia corrente**. A API não tem série histórica por dia — o
+endpoint `queryPlantReportByPlantId` só devolve totais por **ano**, o que foi
+verificado testando 9 combinações de parâmetros. Logo, "a geração de ontem" é um
+dado que não existe nesta API.
+
+Consequência prática: **o relatório precisa rodar depois do pôr do sol.** Antes
+de `HORA_DIA_FECHADO` (padrão 20h) o card sai com ⏳, mostrando a meta do dia mas
+sem julgar nada — porque às 7h da manhã a geração do dia é zero, e um relatório
+que acusa "sem geração" todo dia de manhã é um relatório que ninguém lê no
+terceiro dia.
+
+O cron do workflow está em UTC. `0 1 * * *` = 22h de Brasília (o Brasil não tem
+mais horário de verão, então não muda ao longo do ano).
 
 ## Testar na sua máquina, sem credencial
 
 ```bash
-# terminal 1
-python mock_server.py
+python mock_server.py                       # terminal 1
 
-# terminal 2
-export AUXSOL_BASE_URL=http://127.0.0.1:8899/prod-api
+export AUXSOL_BASE_URL=http://127.0.0.1:8899/prod-api   # terminal 2
 export AUXSOL_APP_ID=1 AUXSOL_APP_SECRET=2
 export GCHAT_WEBHOOK_URL=http://127.0.0.1:8899/gchat
 python main.py relatorio
 ```
 
-O `mock_server.py` devolve dados sintéticos com os três estados de propósito —
-Tijucas gerando bem, Bairro Novo fraco, Makiolka parada e com alarme — e imprime
-no terminal o card que teria ido para o Chat. Use `DEBUG=1` para ver cada
-chamada de API e `DRY_RUN=1` para imprimir o card em vez de enviar.
+O mock devolve dados sintéticos com os três estados de propósito e imprime o card
+que teria ido ao Chat. `DRY_RUN=1` imprime em vez de enviar; `DEBUG=1` loga cada
+chamada; `MOCK_SERIE=ruim|erro` ensaia as falhas da API; `PORTA_MOCK` troca a
+porta.
 
 ## Problemas comuns
 
@@ -200,29 +139,34 @@ chamada de API e `DRY_RUN=1` para imprimir o card em vez de enviar.
 |---|---|
 | `can't open file 'main.py'` | o `main.py` não está na raiz do repositório |
 | `Secrets ausentes: ...` | falta cadastrar em Settings → Secrets and variables |
+| `SyntaxError: invalid decimal literal` na linha 1 | log colado dentro do `main.py`; suba o arquivo por **Upload files**, não copiando texto |
 | `falha na autenticação — HTTP 404` | `AUXSOL_BASE_URL` errada; rode `descobrir-url` |
-| `falha na autenticação — HTTP 401/403` | app_id/app_secret errados, ou credencial não liberada |
-| `a API não retornou nenhuma usina` | a credencial autentica mas não vê os postos: confirmar a conta com a Nansen |
-| `Google Chat recusou o card — HTTP 404` | webhook apagado ou URL truncada (ela tem `key=` **e** `token=`) |
-| `HTTP 429` | limite de 10 req/5 s; o script já espaça as chamadas, mas duas execuções simultâneas estouram |
-| card chega sem o texto da IA | sem `GEMINI_API_KEY`, ou a chave expirou — os números continuam corretos |
-| relatório atrasa 10–20 min | normal: o agendador do GitHub atrasa em horários cheios. Para adiantar, troque o cron para `45 9 * * *` |
+| `HTTP 401/403` | credencial recusada |
+| `a API não retornou nenhuma usina` | a credencial autentica mas não vê os postos |
+| `HTTP 429 Request frequency too high` | limite da Nansen; o script já espaça as chamadas (5 por 5 s, 0,7 s entre elas) |
+| `Google Chat recusou o card — HTTP 404` | webhook apagado ou URL truncada (tem `key=` **e** `token=`) |
+| card sem o texto da IA | sem `GEMINI_API_KEY`, ou 503 do modelo (temporário) — os números não dependem da IA |
+| relatório atrasa 10–20 min | normal: o agendador do GitHub atrasa em horários cheios |
 
 ## Notas técnicas
 
-- **Fuso.** O cron do GitHub é sempre UTC. `0 10 * * *` = 7h em Brasília, e o
-  Brasil não tem mais horário de verão, então não muda ao longo do ano.
-- **Limite de requisições.** A AUXSOL permite 10 requisições por 5 segundos por
-  IP. O `main.py` usa uma janela deslizante com margem (9) e o workflow tem
-  `concurrency` para não rodar duas vezes ao mesmo tempo.
-- **Token.** Vale 12 h. Uma execução usa um só; se a API recusar no meio, o
-  cliente reautentica uma vez e repete a chamada.
-- **Leitura tolerante dos campos.** O formato exato da resposta da Nansen ainda
-  não foi visto com credencial real. O script procura cada dado por uma lista de
-  nomes possíveis (`dayEnergy`, `todayEnergy`, `eDay`, …) em vez de fixar um só,
-  e o que não achar aparece como `—` no card, com aviso — em vez de derrubar o
-  relatório. Se algum número vier errado ou vazio, rode com `DEBUG=1` e o log
-  mostra o JSON cru: com ele, é ajustar a lista de nomes correspondente.
-- **Cálculos.** Eficiência, kWh/kWp, semáforo e totais são calculados em Python.
-  A IA só escreve o comentário e nunca é a fonte de um número — foi decisão de
-  projeto, para o relatório não errar conta.
+- **Limite de requisições.** A Nansen documenta 10 req/5 s por IP, mas com 9
+  tomamos 429 — o runner do GitHub compartilha IP de saída. O script usa 5 por
+  5 s com 0,7 s de intervalo mínimo. Uma execução com 3 usinas faz ~8 chamadas.
+- **Nomes dos campos.** Confirmados contra a API real: `todayYield`,
+  `monthlyYield`, `totalYield`, `capacity`, `currentPower`, `fullLoadHour`,
+  `dt`, `tariff.fixPrice`, `status` (string `"01"`). A busca é tolerante: cada
+  dado é procurado por uma lista de nomes possíveis, e o que falta vira `—` no
+  card com aviso, em vez de derrubar o relatório.
+- **Zero é dado, não ausência.** Usina parada gera 0,0 kWh, e `or` em Python
+  descartaria isso — daí o helper `primeiro()`.
+- **Credencial de convidado.** `isVisitor: true`, nomes com "(Guest)" (o card
+  limpa o sufixo). Basta para ler. Se o comando `alarmes` vier sempre vazio com
+  usinas em operação, pode ser restrição de permissão, não ausência de alarme —
+  vale confirmar com a Nansen, porque um relatório que nunca acusa problema cria
+  confiança falsa.
+- **Cálculos em Python, nunca na IA.** Eficiência, % do esperado, semáforo,
+  economia e totais são calculados no código. A IA só escreve o comentário, e
+  quando falha o card sai completo sem ele.
+- **Se o relatório falhar**, o próprio workflow posta um aviso no espaço do Chat
+  com o link do log.

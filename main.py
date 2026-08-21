@@ -143,17 +143,32 @@ def sem_acento(s: str) -> str:
 _janela: list[float] = []
 
 
+# O limite documentado é 10 req/5 s por IP, mas com 9 tomamos 429 na prática —
+# o runner do GitHub compartilha IP de saída, então o orçamento real é menor que
+# o teórico. Metade do limite, mais um intervalo mínimo entre chamadas.
+MAX_JANELA = 5
+GAP_MINIMO = 0.7
+_ultima_chamada = 0.0
+
+
 def _throttle() -> None:
-    global _janela
+    global _janela, _ultima_chamada
+
+    intervalo = time.monotonic() - _ultima_chamada
+    if _ultima_chamada and intervalo < GAP_MINIMO:
+        time.sleep(GAP_MINIMO - intervalo)
+
     agora_s = time.monotonic()
     _janela = [t for t in _janela if agora_s - t < 5.0]
-    if len(_janela) >= 9:  # margem: 9 em vez de 10
-        espera = 5.0 - (agora_s - _janela[0]) + 0.05
+    if len(_janela) >= MAX_JANELA:
+        espera = 5.0 - (agora_s - _janela[0]) + 0.1
         if espera > 0:
             dbg(f"throttle: aguardando {espera:.2f}s")
             time.sleep(espera)
         _janela = [t for t in _janela if time.monotonic() - t < 5.0]
-    _janela.append(time.monotonic())
+
+    _ultima_chamada = time.monotonic()
+    _janela.append(_ultima_chamada)
 
 
 def http(
@@ -336,18 +351,6 @@ class Auxsol:
             },
         )
 
-    def relatorio_usina(self, plant_id: str, tipo: int = 2, data: str | None = None) -> Any:
-        """tipo: 1=dia 2=mês 3=ano 4=total (nomenclatura da AUXSOL)."""
-        return self.get(
-            "/analysis/plantReport/queryPlantReportByPlantId",
-            {
-                "plantId": plant_id,
-                "timeType": tipo,
-                "queryTime": data or agora().strftime("%Y-%m-%d"),
-                "dataItems": DATA_ITEMS_ENERGIA,
-            },
-        )
-
     def alarmes(self) -> list[dict]:
         d = self.get("/analysis/alarm/list", {"pageNum": 1, "pageSize": 200})
         if isinstance(d, dict):
@@ -473,6 +476,11 @@ DIAS_MES = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 3
 SOMA_PONDERADA = sum(FORMA_MENSAL[m] * DIAS_MES[m] for m in FORMA_MENSAL)
 # Desempenho típico de sistema (perdas de inversor, cabo, temperatura, sujeira).
 RENDIMENTO_SISTEMA = 0.80
+
+# Depois desta hora (local) o dia solar acabou e pode ser julgado. No Sul do
+# Brasil o sol se põe no máximo perto das 19h20 (dezembro), sem horário de
+# verão — 20h é margem segura o ano inteiro.
+HORA_DIA_FECHADO = int(os.environ.get("HORA_DIA_FECHADO", "20") or 20)
 
 
 def esperado_por_kwp(mes: int) -> tuple[float, str]:
@@ -611,35 +619,6 @@ def extrair_serie(rel: Any) -> list[tuple[str, float]]:
     return pontos
 
 
-def casa_dia(rotulo: str, dia: date) -> bool:
-    """'2026-08-20', '20/08/2026', '2026-08-20 00:00', '20' -> True para 20/08."""
-    r = str(rotulo).strip()
-    if dia.isoformat() in r or dia.strftime("%d/%m/%Y") in r or dia.strftime("%Y/%m/%d") in r:
-        return True
-    so_digitos = r.strip().lstrip("0") or "0"
-    return len(r.strip()) <= 2 and so_digitos == str(dia.day)
-
-
-# Combinações de parâmetros para a série histórica, em ordem de tentativa.
-# Necessário porque `timeType=2` — que pela documentação seria "mês" — devolveu
-# uma série ANUAL na API real. Em vez de chutar de novo, o script tenta e
-# verifica: a combinação certa é a que traz o dia pedido.
-COMBOS_SERIE: list[tuple[str, Any, str]] = [
-    ("timeType", 1, "%Y-%m-%d"),
-    ("timeType", 1, "%Y-%m"),
-    ("dateType", 1, "%Y-%m-%d"),
-    ("dateType", 2, "%Y-%m-%d"),
-    ("timeType", 3, "%Y-%m-%d"),
-    ("timeType", 4, "%Y-%m-%d"),
-    ("timeType", 5, "%Y-%m-%d"),
-    ("timeType", 2, "%Y-%m"),
-    ("timeType", 2, "%Y-%m-%d"),  # sabidamente anual: por último, só por garantia
-]
-
-_combo_serie: tuple[str, Any, str] | None = None  # a que funcionou, reusada
-_logou_cru = False  # loga o JSON cru uma vez só, não uma por usina
-
-
 def geracao_anual(api: "Auxsol", pid: str, ano_atual: int) -> float | None:
     """
     kWh gerados no último ano COMPLETO. É o que a série anual (a mesma que não
@@ -665,64 +644,11 @@ def geracao_anual(api: "Auxsol", pid: str, ano_atual: int) -> float | None:
     return anos[completos[-1]]
 
 
-def geracao_do_dia(api: "Auxsol", pid: str, dia: date) -> tuple[float | None, str, str]:
-    """
-    kWh gerados no dia `dia`. Procura a granularidade diária tentando as
-    combinações de parâmetros até uma trazer a data pedida; guarda a vencedora
-    para as usinas seguintes (senão seriam 9 chamadas por usina).
-
-    Devolve (valor, origem, diagnóstico) — o diagnóstico explica POR QUE falhou,
-    porque "não veio" não serve para depurar nada.
-    """
-    global _combo_serie, _logou_cru
-
-    if not pid:
-        return None, "", "usina sem plantId"
-
-    ordem = ([_combo_serie] if _combo_serie else []) + [
-        c for c in COMBOS_SERIE if c != _combo_serie
-    ]
-    ultimo = "nenhuma combinação de parâmetros trouxe a série"
-
-    for parametro, valor, formato in ordem:
-        tentativa = f"{parametro}={valor}, queryTime={dia.strftime(formato)}"
-        try:
-            rel = api.serie(pid, parametro, valor, dia.strftime(formato))
-        except Exception as e:
-            ultimo = f"a API recusou a série ({' '.join(str(e).split())[:90]})"
-            continue
-
-        serie = extrair_serie(rel)
-        if not serie:
-            ultimo = "a série veio em formato não reconhecido"
-            if not _logou_cru:
-                _logou_cru = True
-                log(
-                    f"::warning::série sem pontos com {tentativa}. "
-                    f"JSON cru: {json.dumps(rel, ensure_ascii=False)[:1200]}"
-                )
-            continue
-
-        for rotulo, v in serie:
-            if casa_dia(rotulo, dia):
-                if _combo_serie != (parametro, valor, formato):
-                    _combo_serie = (parametro, valor, formato)
-                    log(f"série diária obtida com {tentativa} — usando isso nas demais usinas")
-                return v, "série da API", ""
-
-        rotulos = [str(r) for r, _ in serie][:6]
-        ultimo = f"a série de {tentativa} não traz {dia.strftime('%d/%m')} ({', '.join(rotulos)})"
-        dbg(f"usina {pid}: {ultimo}")
-
-    return None, "", ultimo
-
-
 def analisar_usina(
     usina: dict,
     detalhe: Any,
     alarmes: list[dict],
     cap_cfg: dict,
-    kwh_dia_forcado: float | None = None,
     anual_por_kwp: float | None = None,
     mes_ref: int | None = None,  # NÃO chamar de `mes`: colide com a geração do mês
 ) -> dict:
@@ -738,10 +664,7 @@ def analisar_usina(
     if kwp and kwp > 5000:
         kwp = kwp / 1000.0
 
-    if kwh_dia_forcado is not None:
-        dia = kwh_dia_forcado
-    else:
-        dia = primeiro(num(pegar(detalhe, CAMPOS_DIA)), num(pegar(usina, CAMPOS_DIA)))
+    dia = primeiro(num(pegar(detalhe, CAMPOS_DIA)), num(pegar(usina, CAMPOS_DIA)))
     mes = primeiro(num(pegar(detalhe, CAMPOS_MES)), num(pegar(usina, CAMPOS_MES)))
     total = primeiro(num(pegar(detalhe, CAMPOS_TOTAL)), num(pegar(usina, CAMPOS_TOTAL)))
     pot = primeiro(num(pegar(detalhe, CAMPOS_POT)), num(pegar(usina, CAMPOS_POT)))
@@ -751,12 +674,9 @@ def analisar_usina(
     atualizado = primeiro(pegar(detalhe, CAMPOS_DT), pegar(usina, CAMPOS_DT))
     tarifa = primeiro(num(pegar(usina, CAMPOS_TARIFA)), num(pegar(detalhe, CAMPOS_TARIFA)))
 
-    # Se estamos usando o dado de ontem, o fullLoadHour da API (que é de hoje)
-    # não serve: recalcula. Só aproveita o da API quando o dia é o mesmo.
-    if dia is not None and kwp:
-        rendimento = dia / kwp
-    else:
-        rendimento = horas_api if kwh_dia_forcado is None else None
+    # kWh/kWp do dia. Calcula a partir da geração; o `fullLoadHour` da API é o
+    # mesmo cálculo, e serve de reserva quando a capacidade não vem.
+    rendimento = (dia / kwp) if (dia is not None and kwp) else horas_api
 
     # Quanto se esperava deste dia neste mês, e quanto esta usina costuma fazer.
     o_mes = mes_ref or agora().month
@@ -768,6 +688,22 @@ def analisar_usina(
     rotulo, icone = classificar(atingido)
 
     economia = (dia * tarifa) if (dia is not None and tarifa) else None
+
+    # --- acumulado do mês -------------------------------------------------- #
+    # O mês é mais robusto que o dia: `monthlyYield` vem direto da API, sem
+    # depender da série diária. E é o número que se compara com a parcela do
+    # financiamento, que é mensal.
+    economia_mes = (mes * tarifa) if (mes is not None and tarifa) else None
+    hoje = agora().date()
+    # dias já decorridos: no mês corrente conta até hoje; num mês fechado, todos
+    dias_corridos = hoje.day if (o_mes == hoje.month) else DIAS_MES[o_mes]
+    esperado_mes = (kwp * ref_por_kwp * dias_corridos) if kwp else None
+    esperado_mes_cheio = (kwp * ref_por_kwp * DIAS_MES[o_mes]) if kwp else None
+    economia_mes_esperada = (esperado_mes * tarifa) if (esperado_mes and tarifa) else None
+    economia_mes_projetada = (
+        (esperado_mes_cheio * tarifa) if (esperado_mes_cheio and tarifa) else None
+    )
+    atingido_mes = (mes / esperado_mes) if (mes is not None and esperado_mes) else None
 
     meus_alarmes = [
         a
@@ -790,6 +726,12 @@ def analisar_usina(
         "atualizado": atualizado,
         "tarifa": tarifa,
         "economia_rs": economia,
+        "economia_mes_rs": economia_mes,
+        "economia_mes_esperada_rs": economia_mes_esperada,
+        "economia_mes_projetada_rs": economia_mes_projetada,
+        "kwh_esperado_mes": esperado_mes,
+        "atingido_mes": atingido_mes,
+        "dias_corridos": dias_corridos,
         "kwh_por_kwp": rendimento,
         "kwh_esperado": esperado,
         "kwh_historico": historico,
@@ -889,8 +831,21 @@ def comentario_ia(analises: list[dict]) -> str:
                 corpo={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config},
                 tentativas=2,
             )
+            if status == 400:
+                # 400 = a própria configuração foi recusada (o gemini-3.6-flash
+                # rejeita thinkingBudget=0). Tentar a variante mais simples é
+                # exatamente o caso de uso desta lista — antes eu dava `break`
+                # aqui e o fallback nunca era alcançado.
+                log(f"aviso: Gemini ({modelo}) recusou esta configuração; tentando a simples")
+                continue
             if status != 200:
-                break  # erro do modelo: não insiste na outra variante
+                motivo = _msg(payload) if isinstance(payload, dict) else str(payload)[:180]
+                log(
+                    f"aviso: Gemini ({modelo}) respondeu HTTP {status}: "
+                    f"{' '.join(str(motivo).split())[:200]}"
+                )
+                break  # 404/503: problema do modelo, vai para o próximo
+
             texto = pegar(payload, ["text"])
             razao = str(pegar(payload, ["finishReason"], ""))
             if texto and razao != "MAX_TOKENS":
@@ -899,12 +854,6 @@ def comentario_ia(analises: list[dict]) -> str:
                 log(f"aviso: Gemini ({modelo}) truncou a resposta; tentando outra configuração")
                 continue
             break
-        # a mensagem da própria API é o diagnóstico; só o status não diz nada
-        motivo = _msg(payload) if isinstance(payload, dict) else str(payload)[:180]
-        log(
-            f"aviso: Gemini ({modelo}) respondeu HTTP {status}: "
-            f"{' '.join(str(motivo).split())[:200]}"
-        )
     log("aviso: card segue sem o comentário da IA. Rode 'testar-gemini' para diagnosticar.")
     return ""
 
@@ -941,14 +890,17 @@ def montar_card(
     else:
         pct_geral = None
 
+    # O título carrega o PIOR estado entre as usinas. Antes ele checava alarme e
+    # 🟡 mas esquecia o 🔴 de geração, e saía 🟢 com duas usinas em vermelho.
+    presentes = {a["icone"] for a in analises}
+    titulo_icone = "🟢"
     if n_alarmes:
         titulo_icone = "🔴"
-    elif any(a["icone"] == "🟡" for a in analises):
-        titulo_icone = "🟡"
-    elif all(a["icone"] == "⏳" for a in analises):
-        titulo_icone = "⏳"
     else:
-        titulo_icone = "🟢"
+        for icone in ("🔴", "🟡", "⏳", "❔"):
+            if icone in presentes:
+                titulo_icone = icone
+                break
 
     secoes: list[dict] = [
         {
@@ -1035,10 +987,32 @@ def montar_card(
             extras.append(
                 {
                     "decoratedText": {
-                        "topLabel": "Economia estimada",
+                        "topLabel": "Economia no dia",
                         "text": f"<b>R$ {fmt(a['economia_rs'])}</b>",
                         "bottomLabel": f"teto, a R$ {fmt(a['tarifa'], '', 2)}/kWh "
                         "cadastrado na plataforma",
+                    }
+                }
+            )
+
+        if a["economia_mes_rs"] is not None:
+            texto_mes = f"<b>R$ {fmt(a['economia_mes_rs'])}</b>"
+            if a["atingido_mes"] is not None:
+                texto_mes += f"  ·  <b>{a['atingido_mes']:.0%}</b> do esperado"
+            rodape_mes = (
+                f"{a['dias_corridos']} dia(s) do mês · esperado até aqui: "
+                f"R$ {fmt(a['economia_mes_esperada_rs'])}"
+                if a["economia_mes_esperada_rs"]
+                else f"{a['dias_corridos']} dia(s) do mês"
+            )
+            if a["economia_mes_projetada_rs"]:
+                rodape_mes += f" · mês fechado deve dar R$ {fmt(a['economia_mes_projetada_rs'])}"
+            extras.append(
+                {
+                    "decoratedText": {
+                        "topLabel": "Economia no mês",
+                        "text": texto_mes,
+                        "bottomLabel": rodape_mes,
                     }
                 }
             )
@@ -1335,9 +1309,16 @@ def cmd_relatorio() -> int:
         alarmes = []
         avisos.append(f"não foi possível ler os alarmes: {e}")
 
-    # O card das 7h fala do dia fechado: ontem. Às 7h a geração de "hoje"
-    # é praticamente zero e não diz nada.
-    dia_ref = agora().date() - timedelta(days=1)
+    # O relatório fala do DIA CORRENTE, via `todayYield`. A série histórica por
+    # dia não existe nesta API (o endpoint só devolve totais por ano), então
+    # tentar falar de ontem era buscar um dado que não está lá — além de gastar
+    # 9 chamadas por usina e estourar o limite de requisições.
+    #
+    # Consequência: o horário importa. Depois do pôr do sol o dia está fechado e
+    # pode ser julgado; antes disso é parcial e julgar seria alarme falso.
+    agora_ = agora()
+    dia_ref = agora_.date()
+    dia_fechado = agora_.hour >= HORA_DIA_FECHADO
 
     analises: list[dict] = []
     cap_cfg = capacidades_configuradas()
@@ -1350,44 +1331,30 @@ def cmd_relatorio() -> int:
             except Exception as e:
                 avisos.append(f"sem dados em tempo real da usina {pid}: {e}")
 
-        kwh_ontem, origem, diagnostico = geracao_do_dia(api, pid, dia_ref)
-
-        # Calibra o esperado com o histórico da própria usina.
+        # Histórico anual: é o que este endpoint entrega bem, e serve de contexto.
         kwp_cadastrado = num(pegar(u, CAMPOS_KWP))
         total_ano = geracao_anual(api, pid, dia_ref.year)
         anual_por_kwp = (total_ano / kwp_cadastrado) if (total_ano and kwp_cadastrado) else None
 
         a = analisar_usina(
-            u,
-            detalhe,
-            alarmes,
-            cap_cfg,
-            kwh_dia_forcado=kwh_ontem,
-            anual_por_kwp=anual_por_kwp,
-            mes_ref=dia_ref.month,
+            u, detalhe, alarmes, cap_cfg, anual_por_kwp=anual_por_kwp, mes_ref=dia_ref.month
         )
-        a["origem_dia"] = origem
-        a["parcial"] = False
         a["data_numero"] = dia_ref
+        a["parcial"] = not dia_fechado
 
-        if kwh_ontem is None:
-            if a["kwh_dia"] is not None:
-                # Cai para o acumulado de HOJE — que é de outro dia e ainda por
-                # fechar. O rótulo tem de mudar junto com o número, senão o card
-                # anuncia ontem e mostra hoje.
-                a["parcial"] = True
-                a["data_numero"] = agora().date()
-                a["origem_dia"] = f"parcial, até {agora().strftime('%H:%M')}"
-                # Um dia em curso NÃO se compara com a expectativa de dia
-                # fechado: às 7h daria "sem geração" nas três usinas, todo dia.
-                # Alarme falso diário treina a equipe a ignorar o relatório.
-                a["rotulo"] = "dia em curso, ainda sem julgar"
-                a["icone"] = "🔴" if a["alarmes"] else "⏳"
-                a["atingido"] = None  # % de um dia pela metade não significa nada
-                avisos.append(f"{a['nome']}: {diagnostico}. Mostrando o parcial de hoje.")
-            else:
-                a["origem_dia"] = "sem dado"
-                avisos.append(f"{a['nome']}: {diagnostico}. Também não há dado de hoje.")
+        if a["kwh_dia"] is None:
+            a["origem_dia"] = "sem dado"
+            avisos.append(f"{a['nome']}: a API não devolveu a geração do dia.")
+        elif dia_fechado:
+            a["origem_dia"] = f"dia fechado, leitura das {agora_.strftime('%H:%M')}"
+        else:
+            # Dia em curso não se compara com a expectativa de dia inteiro:
+            # às 7h daria "sem geração" nas três usinas, todo dia. Alarme falso
+            # diário treina a equipe a ignorar o relatório.
+            a["origem_dia"] = f"parcial, até {agora_.strftime('%H:%M')}"
+            a["rotulo"] = "dia em curso, ainda sem julgar"
+            a["icone"] = "🔴" if a["alarmes"] else "⏳"
+            a["atingido"] = None
         analises.append(a)
 
     # problema primeiro: quem precisa de ação aparece no topo do card.
@@ -1420,77 +1387,6 @@ def cmd_relatorio() -> int:
     card = montar_card(analises, comentario_ia(analises), avisos, dia_ref, periodo, subtitulo)
     enviar_chat(card)
     return 0
-
-
-def cmd_sondar_serie() -> int:
-    """
-    Descobre qual combinação de parâmetros do queryPlantReportByPlantId devolve
-    granularidade DIÁRIA. `timeType=2` devolveu anos, então o significado dos
-    valores não é o que a documentação sugere — em vez de chutar, testa a matriz
-    e mostra os rótulos que cada combinação retorna.
-    """
-    exigir("AUXSOL_BASE_URL", "AUXSOL_APP_ID", "AUXSOL_APP_SECRET")
-    api = Auxsol(BASE_URL, APP_ID, APP_SECRET)
-
-    pid = PLANT_IDS[0] if PLANT_IDS else str(pegar(api.usinas()[0], CAMPOS_ID, ""))
-    ontem = (agora().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    mes = ontem[:7]
-    ano = ontem[:4]
-    log(f"sondando a usina {pid}, procurando o dia {ontem}\n")
-
-    combos: list[tuple[str, Any, str]] = []
-    for valor in (1, 2, 3, 4, 5):
-        combos.append(("timeType", valor, ontem))
-    for valor in (1, 2, 3, 4):
-        combos.append(("dateType", valor, ontem))
-    for tempo in (mes, ano, ontem + " 00:00:00"):
-        combos.append(("timeType", 2, tempo))
-
-    achou: list[str] = []
-    for chave, valor, tempo in combos:
-        params = {
-            "plantId": pid,
-            chave: valor,
-            "queryTime": tempo,
-            "dataItems": DATA_ITEMS_ENERGIA,
-        }
-        try:
-            rel = api.get("/analysis/plantReport/queryPlantReportByPlantId", params)
-        except Exception as e:
-            log(f"  {chave}={valor} queryTime={tempo:<22} ❌ {' '.join(str(e).split())[:80]}")
-            continue
-
-        serie = extrair_serie(rel)
-        rotulos = [r for r, _ in serie]
-        if not rotulos:
-            itens = []
-            if isinstance(rel, list):
-                itens = sorted({b.get("dataItem") for b in rel if isinstance(b, dict)} - {None})
-            log(f"  {chave}={valor} queryTime={tempo:<22} — sem pontos (dataItems: {itens})")
-            continue
-
-        # o que interessa: os rótulos parecem DIAS?
-        diario = any(casa_dia(r, agora().date() - timedelta(days=1)) for r in rotulos)
-        marca = "✅ DIÁRIO" if diario else "   "
-        log(
-            f"  {chave}={valor} queryTime={tempo:<22} {marca} "
-            f"{len(rotulos)} ponto(s): {rotulos[:6]}"
-        )
-        if diario:
-            achou.append(f"{chave}={valor} queryTime={tempo}")
-
-    if achou:
-        log(f"\n>>> Combinação que devolve dias: {achou[0]}")
-        log("    Me mande esta linha e eu fixo no código.")
-        return 0
-    log(
-        "\nNenhuma combinação devolveu granularidade diária.\n"
-        "Nesse caso o relatório muda de estratégia: roda às 22h sobre o dia\n"
-        "corrente (que a essa hora já está praticamente fechado) em vez de às 7h\n"
-        "sobre o dia anterior. Os números passam a ser do próprio dia, honestos,\n"
-        "e sem depender deste endpoint."
-    )
-    return 1
 
 
 def cmd_testar_gemini() -> int:
@@ -1549,7 +1445,6 @@ def cmd_testar_gemini() -> int:
 
 COMANDOS = {
     "relatorio": cmd_relatorio,
-    "sondar-serie": cmd_sondar_serie,
     "testar-gemini": cmd_testar_gemini,
     "descobrir-url": cmd_descobrir_url,
     "listar-usinas": cmd_listar_usinas,
