@@ -16,33 +16,34 @@ do card de uma vez. Os SNs dos dataloggers são os reais dos 3 postos.
 
 import calendar
 import json
+import os
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORTA = 8899
+PORTA = int(os.environ.get("PORTA_MOCK", "8899"))
 
 USINAS = [
     {
-        "plantId": 1001,
-        "plantName": "Posto Tijucas",
-        "capacity": 60.0,
-        "plantStatus": 1,
+        "plantId": 1408,
+        "plantName": "Posto Tijucas (Guest)",
+        "capacity": 100.0,
+        "status": "01",
         "dataloggerSn": "A012311030084010",
         "perfil": "bom",
     },
     {
-        "plantId": 1002,
-        "plantName": "Posto Bairro Novo",
-        "capacity": 60.0,
-        "plantStatus": 1,
+        "plantId": 1348,
+        "plantName": "Posto Bairro Novo (Guest)",
+        "capacity": 75.0,
+        "status": "01",
         "dataloggerSn": "A012311130984125",
         "perfil": "fraco",
     },
     {
-        "plantId": 1003,
-        "plantName": "Posto Makiolka",
-        "capacity": 60.0,
-        "plantStatus": 2,
+        "plantId": 1460,
+        "plantName": "Posto Makiolka (Guest)",
+        "capacity": 75.0,
+        "status": "01",
         "dataloggerSn": "A012311130950854",
         "perfil": "parada",
     },
@@ -81,18 +82,21 @@ def atual(usina):
         "plantId": usina["plantId"],
         "plantName": usina["plantName"],
         "capacity": usina["capacity"],
+        "fullLoadHour": round(RENDIMENTO[usina["perfil"]] * 0.08, 2),
+        "dt": f"{date.today().isoformat()} 06:45:12",
+        "tariff": {"plantId": usina["plantId"], "fixPrice": 0.87, "priceType": "1"},
         "currentPower": round(usina["capacity"] * 0.05, 2) if usina["perfil"] != "parada" else 0.0,
-        "dayEnergy": round(base * 0.08, 2),  # 7h da manhã: quase nada ainda
-        "monthEnergy": round(base * date.today().day, 2),
-        "totalEnergy": round(base * 420, 2),
-        "plantStatus": usina["plantStatus"],
+        "todayYield": round(base * 0.08, 2),  # 7h da manhã: quase nada ainda
+        "monthlyYield": round(base * date.today().day, 2),
+        "totalYield": round(base * 420, 2),
+        "status": usina["status"],
     }
 
 
 ALARMES = [
     {
-        "plantId": 1003,
-        "plantName": "Posto Makiolka",
+        "plantId": 1460,
+        "plantName": "Posto Makiolka (Guest)",
         "alarmName": "Inversor sem comunicação",
         "alarmLevel": 3,
         "alarmTime": f"{date.today().isoformat()} 03:12:00",
