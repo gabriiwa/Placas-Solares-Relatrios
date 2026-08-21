@@ -176,7 +176,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._responder({"code": "AWX-5003", "msg": "sem permissão de convidado"}, 200)
             if modo == "ruim":
                 return self._responder(envelope({"plantId": u["plantId"], "resumo": "sem série"}))
-            return self._responder(envelope({"plantId": u["plantId"], "dataList": serie_mensal(u)}))
+            # formato real da Nansen: uma lista de blocos, um por dataItem
+            pontos = serie_mensal(u)
+            return self._responder(envelope([
+                {"dataItem": 6, "data": [{"dt": x["time"], "value": x["generation"]} for x in pontos],
+                 "inverterYield": None, "weather": None, "astro": None},
+                {"dataItem": 7, "data": [{"dt": x["time"], "value": x["gridPurchase"]} for x in pontos]},
+                {"dataItem": 8, "data": [{"dt": x["time"], "value": x["gridFeedIn"]} for x in pontos]},
+            ]))
 
         if p == "/prod-api/analysis/alarm/list":
             return self._responder(envelope({"total": len(ALARMES), "list": ALARMES}))

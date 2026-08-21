@@ -464,7 +464,15 @@ def classificar(kwh_por_kwp: float | None) -> tuple[str, str]:
     return "geração muito abaixo do esperado", "🔴"
 
 
-CAMPOS_DATA_SERIE = ["time", "date", "day", "statTime", "queryTime", "dateStr", "xaxis", "label"]
+# "dt" é o nome real do rótulo temporal na resposta da Nansen (confirmado
+# 21/08/2026); os outros ficam como rede de segurança.
+CAMPOS_DATA_SERIE = ["dt", "time", "date", "day", "statTime", "queryTime", "dateStr", "label"]
+
+# Bits do dataItems: 6 = geração, 7 = comprado da rede, 8 = injetado,
+# 11 = consumo da carga, 12 = autoconsumo. A resposta vem como uma LISTA de
+# blocos, um por dataItem — misturar os blocos daria número errado, então a
+# geração é escolhida explicitamente.
+DATA_ITEM_GERACAO = 6
 CAMPOS_VALOR_SERIE = [
     "generation",
     "pvGeneration",
@@ -489,6 +497,34 @@ def extrair_serie(rel: Any) -> list[tuple[str, float]]:
     Devolve [] se não reconhecer nada — o chamador cai no plano B.
     """
     pontos: list[tuple[str, float]] = []
+
+    # FORMATO REAL DA NANSEN (confirmado 21/08/2026):
+    #   [{"dataItem": 6, "data": [{"dt": "2026-08-20", "value": 223.3}, ...]}, ...]
+    # Um bloco por série. Pega só o bloco 6 (geração): juntar os blocos somaria
+    # geração com energia comprada da rede.
+    if isinstance(rel, list) and rel and all(isinstance(x, dict) for x in rel):
+        if any("dataItem" in b for b in rel):
+            bloco = next(
+                (
+                    b
+                    for b in rel
+                    if b.get("dataItem") == DATA_ITEM_GERACAO and isinstance(b.get("data"), list)
+                ),
+                None,
+            )
+            if bloco is None:
+                itens = sorted({b.get("dataItem") for b in rel if "dataItem" in b} - {None})
+                dbg(f"resposta sem o dataItem {DATA_ITEM_GERACAO} de geração; veio: {itens}")
+                return []
+            for p in bloco["data"]:
+                if not isinstance(p, dict):
+                    continue
+                rotulo = pegar(p, CAMPOS_DATA_SERIE)
+                valor = num(pegar(p, CAMPOS_VALOR_SERIE))
+                # value: null é mês/ano sem dado — descartar, não virar zero
+                if rotulo not in (None, "") and valor is not None:
+                    pontos.append((str(rotulo), valor))
+            return pontos
 
     # A / C — qualquer lista de dicts com um campo de data e um de valor
     def varrer(obj: Any) -> None:
@@ -700,24 +736,38 @@ def comentario_ia(analises: list[dict]) -> str:
     modelos = list(
         dict.fromkeys(filter(None, [GEMINI_MODEL, "gemini-flash-latest", "gemini-2.0-flash"]))
     )
+
+    # Os modelos flash atuais "pensam" antes de responder, e o raciocínio consome
+    # o mesmo orçamento de tokens da resposta: com 300 o texto saía cortado no
+    # meio da frase. Orçamento maior + pedido para não gastar tokens pensando.
+    # A segunda variante existe porque modelos antigos rejeitam thinkingConfig.
+    variantes = [
+        {"temperature": 0.2, "maxOutputTokens": 1200, "thinkingConfig": {"thinkingBudget": 0}},
+        {"temperature": 0.2, "maxOutputTokens": 1200},
+    ]
+
     for modelo in modelos:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{modelo}:generateContent?key={urllib.parse.quote(GEMINI_API_KEY)}"
         )
-        status, payload = http(
-            url,
-            "POST",
-            corpo={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 300},
-            },
-            tentativas=2,
-        )
-        if status == 200:
+        for config in variantes:
+            status, payload = http(
+                url,
+                "POST",
+                corpo={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config},
+                tentativas=2,
+            )
+            if status != 200:
+                break  # erro do modelo: não insiste na outra variante
             texto = pegar(payload, ["text"])
-            if texto:
+            razao = str(pegar(payload, ["finishReason"], ""))
+            if texto and razao != "MAX_TOKENS":
                 return " ".join(str(texto).split())
+            if razao == "MAX_TOKENS":
+                log(f"aviso: Gemini ({modelo}) truncou a resposta; tentando outra configuração")
+                continue
+            break
         # a mensagem da própria API é o diagnóstico; só o status não diz nada
         motivo = _msg(payload) if isinstance(payload, dict) else str(payload)[:180]
         log(
@@ -1193,6 +1243,77 @@ def cmd_relatorio() -> int:
     return 0
 
 
+def cmd_sondar_serie() -> int:
+    """
+    Descobre qual combinação de parâmetros do queryPlantReportByPlantId devolve
+    granularidade DIÁRIA. `timeType=2` devolveu anos, então o significado dos
+    valores não é o que a documentação sugere — em vez de chutar, testa a matriz
+    e mostra os rótulos que cada combinação retorna.
+    """
+    exigir("AUXSOL_BASE_URL", "AUXSOL_APP_ID", "AUXSOL_APP_SECRET")
+    api = Auxsol(BASE_URL, APP_ID, APP_SECRET)
+
+    pid = PLANT_IDS[0] if PLANT_IDS else str(pegar(api.usinas()[0], CAMPOS_ID, ""))
+    ontem = (agora().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    mes = ontem[:7]
+    ano = ontem[:4]
+    log(f"sondando a usina {pid}, procurando o dia {ontem}\n")
+
+    combos: list[tuple[str, Any, str]] = []
+    for valor in (1, 2, 3, 4, 5):
+        combos.append(("timeType", valor, ontem))
+    for valor in (1, 2, 3, 4):
+        combos.append(("dateType", valor, ontem))
+    for tempo in (mes, ano, ontem + " 00:00:00"):
+        combos.append(("timeType", 2, tempo))
+
+    achou: list[str] = []
+    for chave, valor, tempo in combos:
+        params = {
+            "plantId": pid,
+            chave: valor,
+            "queryTime": tempo,
+            "dataItems": DATA_ITEMS_ENERGIA,
+        }
+        try:
+            rel = api.get("/analysis/plantReport/queryPlantReportByPlantId", params)
+        except Exception as e:
+            log(f"  {chave}={valor} queryTime={tempo:<22} ❌ {' '.join(str(e).split())[:80]}")
+            continue
+
+        serie = extrair_serie(rel)
+        rotulos = [r for r, _ in serie]
+        if not rotulos:
+            itens = []
+            if isinstance(rel, list):
+                itens = sorted({b.get("dataItem") for b in rel if isinstance(b, dict)} - {None})
+            log(f"  {chave}={valor} queryTime={tempo:<22} — sem pontos (dataItems: {itens})")
+            continue
+
+        # o que interessa: os rótulos parecem DIAS?
+        diario = any(casa_dia(r, agora().date() - timedelta(days=1)) for r in rotulos)
+        marca = "✅ DIÁRIO" if diario else "   "
+        log(
+            f"  {chave}={valor} queryTime={tempo:<22} {marca} "
+            f"{len(rotulos)} ponto(s): {rotulos[:6]}"
+        )
+        if diario:
+            achou.append(f"{chave}={valor} queryTime={tempo}")
+
+    if achou:
+        log(f"\n>>> Combinação que devolve dias: {achou[0]}")
+        log("    Me mande esta linha e eu fixo no código.")
+        return 0
+    log(
+        "\nNenhuma combinação devolveu granularidade diária.\n"
+        "Nesse caso o relatório muda de estratégia: roda às 22h sobre o dia\n"
+        "corrente (que a essa hora já está praticamente fechado) em vez de às 7h\n"
+        "sobre o dia anterior. Os números passam a ser do próprio dia, honestos,\n"
+        "e sem depender deste endpoint."
+    )
+    return 1
+
+
 def cmd_testar_gemini() -> int:
     """Pergunta à própria API do Google quais modelos a chave pode usar."""
     exigir("GEMINI_API_KEY")
@@ -1249,6 +1370,7 @@ def cmd_testar_gemini() -> int:
 
 COMANDOS = {
     "relatorio": cmd_relatorio,
+    "sondar-serie": cmd_sondar_serie,
     "testar-gemini": cmd_testar_gemini,
     "descobrir-url": cmd_descobrir_url,
     "listar-usinas": cmd_listar_usinas,
