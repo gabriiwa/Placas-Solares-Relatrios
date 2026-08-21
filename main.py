@@ -324,6 +324,18 @@ class Auxsol:
     def dados_atuais(self, plant_id: str) -> Any:
         return self.get(f"/analysis/plantReport/queryPlantCurrentData/{plant_id}")
 
+    def serie(self, plant_id: str, parametro: str, valor: Any, tempo: str) -> Any:
+        """Série histórica, com o nome do parâmetro de granularidade variável."""
+        return self.get(
+            "/analysis/plantReport/queryPlantReportByPlantId",
+            {
+                "plantId": plant_id,
+                parametro: valor,
+                "queryTime": tempo,
+                "dataItems": DATA_ITEMS_ENERGIA,
+            },
+        )
+
     def relatorio_usina(self, plant_id: str, tipo: int = 2, data: str | None = None) -> Any:
         """tipo: 1=dia 2=mês 3=ano 4=total (nomenclatura da AUXSOL)."""
         return self.get(
@@ -448,20 +460,54 @@ def limpar_nome(nome: str) -> str:
     return limpo or "usina sem nome"
 
 
-def classificar(kwh_por_kwp: float | None) -> tuple[str, str]:
-    """Devolve (rótulo, ícone) comparando com KWH_POR_KWP_ESPERADO."""
-    if kwh_por_kwp is None:
-        return "sem dado de capacidade", "❔"
-    r = kwh_por_kwp / KWH_POR_KWP_ESPERADO
-    if r >= 0.95:
-        return "geração acima do esperado", "🟢"
-    if r >= 0.75:
-        return "geração dentro do esperado", "🟢"
-    if r >= 0.50:
-        return "geração abaixo do esperado", "🟡"
-    if kwh_por_kwp <= 0.05:
+# Forma da curva anual de irradiação para a região de Curitiba (kWh/m²/dia em
+# plano inclinado). O que importa aqui é a PROPORÇÃO entre os meses, não o valor
+# absoluto: agosto rende cerca de 60% de dezembro, e comparar os dois com um
+# número único faz o inverno parecer defeito.
+FORMA_MENSAL = {
+    1: 5.00, 2: 5.00, 3: 4.60, 4: 4.20, 5: 3.60, 6: 3.30,
+    7: 3.50, 8: 4.30, 9: 4.20, 10: 4.70, 11: 5.40, 12: 5.40,
+}
+DIAS_MES = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+# Σ(forma × dias): converte "kWh/kWp no ano" em "kWh/kWp por dia neste mês".
+SOMA_PONDERADA = sum(FORMA_MENSAL[m] * DIAS_MES[m] for m in FORMA_MENSAL)
+# Desempenho típico de sistema (perdas de inversor, cabo, temperatura, sujeira).
+RENDIMENTO_SISTEMA = 0.80
+
+
+def esperado_por_kwp(mes: int) -> tuple[float, str]:
+    """
+    kWh/kWp que um sistema SAUDÁVEL deveria fazer num dia deste mês.
+
+    Deliberadamente NÃO usa o histórico da usina como referência: uma usina que
+    sempre gerou pouco tem histórico baixo e seria aprovada por comparação
+    consigo mesma. O histórico entra separado, como contexto — não como meta.
+    """
+    if os.environ.get("KWH_POR_KWP_ESPERADO", "").strip():
+        return KWH_POR_KWP_ESPERADO, "valor fixo do .env"
+    return FORMA_MENSAL[mes] * RENDIMENTO_SISTEMA, "referência regional"
+
+
+def historico_por_kwp(mes: int, anual_por_kwp: float | None) -> float | None:
+    """kWh/kWp que ESTA usina costuma fazer num dia deste mês, pelo ano passado."""
+    if not anual_por_kwp or anual_por_kwp <= 0:
+        return None
+    return anual_por_kwp * FORMA_MENSAL[mes] / SOMA_PONDERADA
+
+
+def classificar(atingido: float | None) -> tuple[str, str]:
+    """(rótulo, ícone) a partir da fração do esperado que foi atingida."""
+    if atingido is None:
+        return "sem referência para comparar", "❔"
+    if atingido >= 1.10:
+        return f"{atingido:.0%} do esperado — acima", "🟢"
+    if atingido >= 0.85:
+        return f"{atingido:.0%} do esperado", "🟢"
+    if atingido >= 0.60:
+        return f"{atingido:.0%} do esperado — atenção", "🟡"
+    if atingido <= 0.02:
         return "sem geração no dia", "🔴"
-    return "geração muito abaixo do esperado", "🔴"
+    return f"{atingido:.0%} do esperado — muito abaixo", "🔴"
 
 
 # "dt" é o nome real do rótulo temporal na resposta da Nansen (confirmado
@@ -574,39 +620,101 @@ def casa_dia(rotulo: str, dia: date) -> bool:
     return len(r.strip()) <= 2 and so_digitos == str(dia.day)
 
 
+# Combinações de parâmetros para a série histórica, em ordem de tentativa.
+# Necessário porque `timeType=2` — que pela documentação seria "mês" — devolveu
+# uma série ANUAL na API real. Em vez de chutar de novo, o script tenta e
+# verifica: a combinação certa é a que traz o dia pedido.
+COMBOS_SERIE: list[tuple[str, Any, str]] = [
+    ("timeType", 1, "%Y-%m-%d"),
+    ("timeType", 1, "%Y-%m"),
+    ("dateType", 1, "%Y-%m-%d"),
+    ("dateType", 2, "%Y-%m-%d"),
+    ("timeType", 3, "%Y-%m-%d"),
+    ("timeType", 4, "%Y-%m-%d"),
+    ("timeType", 5, "%Y-%m-%d"),
+    ("timeType", 2, "%Y-%m"),
+    ("timeType", 2, "%Y-%m-%d"),  # sabidamente anual: por último, só por garantia
+]
+
+_combo_serie: tuple[str, Any, str] | None = None  # a que funcionou, reusada
+_logou_cru = False  # loga o JSON cru uma vez só, não uma por usina
+
+
+def geracao_anual(api: "Auxsol", pid: str, ano_atual: int) -> float | None:
+    """
+    kWh gerados no último ano COMPLETO. É o que a série anual (a mesma que não
+    servia para o dia) entrega bem — e serve para calibrar o esperado.
+    O ano corrente é ignorado porque está pela metade.
+    """
+    try:
+        rel = api.serie(pid, "timeType", 2, f"{ano_atual}-01-01")
+    except Exception as e:
+        dbg(f"histórico anual da usina {pid} falhou: {e}")
+        return None
+
+    anos: dict[int, float] = {}
+    for rotulo, valor in extrair_serie(rel):
+        texto = str(rotulo).strip()
+        if len(texto) == 4 and texto.isdigit() and valor > 0:
+            anos[int(texto)] = valor
+
+    completos = sorted(a for a in anos if a < ano_atual)
+    if not completos:
+        return None
+    # o mais recente completo: reflete o estado atual da usina melhor que a média
+    return anos[completos[-1]]
+
+
 def geracao_do_dia(api: "Auxsol", pid: str, dia: date) -> tuple[float | None, str, str]:
     """
-    kWh gerados no dia `dia`, buscados na série do mês.
-    Devolve (valor, origem, diagnóstico). O diagnóstico explica POR QUE falhou —
-    "não veio" é inútil para depurar, e o JSON cru vai para o log sem depender
-    de ninguém lembrar de marcar a caixinha de debug.
+    kWh gerados no dia `dia`. Procura a granularidade diária tentando as
+    combinações de parâmetros até uma trazer a data pedida; guarda a vencedora
+    para as usinas seguintes (senão seriam 9 chamadas por usina).
+
+    Devolve (valor, origem, diagnóstico) — o diagnóstico explica POR QUE falhou,
+    porque "não veio" não serve para depurar nada.
     """
+    global _combo_serie, _logou_cru
+
     if not pid:
         return None, "", "usina sem plantId"
 
-    try:
-        rel = api.relatorio_usina(pid, tipo=2, data=dia.strftime("%Y-%m-%d"))
-    except Exception as e:
-        return None, "", f"a API recusou a série mensal ({' '.join(str(e).split())[:120]})"
+    ordem = ([_combo_serie] if _combo_serie else []) + [
+        c for c in COMBOS_SERIE if c != _combo_serie
+    ]
+    ultimo = "nenhuma combinação de parâmetros trouxe a série"
 
-    serie = extrair_serie(rel)
-    if not serie:
-        log(
-            f"::warning::série da usina {pid} em formato não reconhecido. "
-            f"JSON cru: {json.dumps(rel, ensure_ascii=False)[:1500]}"
-        )
-        return None, "", "a série mensal veio em formato não reconhecido (JSON cru no log)"
+    for parametro, valor, formato in ordem:
+        tentativa = f"{parametro}={valor}, queryTime={dia.strftime(formato)}"
+        try:
+            rel = api.serie(pid, parametro, valor, dia.strftime(formato))
+        except Exception as e:
+            ultimo = f"a API recusou a série ({' '.join(str(e).split())[:90]})"
+            continue
 
-    for rotulo, valor in serie:
-        if casa_dia(rotulo, dia):
-            return valor, "série mensal da API", ""
+        serie = extrair_serie(rel)
+        if not serie:
+            ultimo = "a série veio em formato não reconhecido"
+            if not _logou_cru:
+                _logou_cru = True
+                log(
+                    f"::warning::série sem pontos com {tentativa}. "
+                    f"JSON cru: {json.dumps(rel, ensure_ascii=False)[:1200]}"
+                )
+            continue
 
-    rotulos = [str(r) for r, _ in serie][:10]
-    log(
-        f"::warning::série da usina {pid} não contém {dia.isoformat()}. "
-        f"Rótulos encontrados: {rotulos}"
-    )
-    return None, "", f"a série mensal não traz {dia.strftime('%d/%m')} (rótulos: {', '.join(rotulos[:4])})"
+        for rotulo, v in serie:
+            if casa_dia(rotulo, dia):
+                if _combo_serie != (parametro, valor, formato):
+                    _combo_serie = (parametro, valor, formato)
+                    log(f"série diária obtida com {tentativa} — usando isso nas demais usinas")
+                return v, "série da API", ""
+
+        rotulos = [str(r) for r, _ in serie][:6]
+        ultimo = f"a série de {tentativa} não traz {dia.strftime('%d/%m')} ({', '.join(rotulos)})"
+        dbg(f"usina {pid}: {ultimo}")
+
+    return None, "", ultimo
 
 
 def analisar_usina(
@@ -615,6 +723,8 @@ def analisar_usina(
     alarmes: list[dict],
     cap_cfg: dict,
     kwh_dia_forcado: float | None = None,
+    anual_por_kwp: float | None = None,
+    mes_ref: int | None = None,  # NÃO chamar de `mes`: colide com a geração do mês
 ) -> dict:
     nome = limpar_nome(str(pegar(usina, CAMPOS_NOME, "usina sem nome")))
     pid = str(pegar(usina, CAMPOS_ID, ""))
@@ -647,7 +757,15 @@ def analisar_usina(
         rendimento = dia / kwp
     else:
         rendimento = horas_api if kwh_dia_forcado is None else None
-    rotulo, icone = classificar(rendimento)
+
+    # Quanto se esperava deste dia neste mês, e quanto esta usina costuma fazer.
+    o_mes = mes_ref or agora().month
+    ref_por_kwp, base_ref = esperado_por_kwp(o_mes)
+    hist_por_kwp = historico_por_kwp(o_mes, anual_por_kwp)
+    esperado = (kwp * ref_por_kwp) if kwp else None
+    historico = (kwp * hist_por_kwp) if (kwp and hist_por_kwp) else None
+    atingido = (rendimento / ref_por_kwp) if (rendimento is not None and ref_por_kwp) else None
+    rotulo, icone = classificar(atingido)
 
     economia = (dia * tarifa) if (dia is not None and tarifa) else None
 
@@ -673,6 +791,10 @@ def analisar_usina(
         "tarifa": tarifa,
         "economia_rs": economia,
         "kwh_por_kwp": rendimento,
+        "kwh_esperado": esperado,
+        "kwh_historico": historico,
+        "atingido": atingido,
+        "base_referencia": base_ref,
         "rotulo": rotulo,
         "icone": icone,
         "alarmes": meus_alarmes,
@@ -720,6 +842,11 @@ def comentario_ia(analises: list[dict]) -> str:
             "kwp_instalado": a["kwp"],
             "kwh_no_dia": a["kwh_dia"],
             "kwh_por_kwp": round(a["kwh_por_kwp"], 2) if a["kwh_por_kwp"] else None,
+            "kwh_esperado": round(a["kwh_esperado"], 1) if a["kwh_esperado"] else None,
+            "percentual_do_esperado": f"{a['atingido']:.0%}" if a["atingido"] else None,
+            "kwh_que_esta_usina_costuma_fazer": round(a["kwh_historico"], 1)
+            if a["kwh_historico"]
+            else None,
             "kwh_no_mes": a["kwh_mes"],
             "economia_estimada_reais": round(a["economia_rs"], 2) if a["economia_rs"] else None,
             "ultima_leitura": a["atualizado"],
@@ -733,8 +860,12 @@ def comentario_ia(analises: list[dict]) -> str:
     )
 
     # o filter(None) evita tentar um modelo vazio se a variável vier em branco
+    # gemini-2.0-flash foi aposentado (a própria API respondeu 404 indicando o
+    # substituto). O "-latest" às vezes dá 503 por demanda, daí a lista.
     modelos = list(
-        dict.fromkeys(filter(None, [GEMINI_MODEL, "gemini-flash-latest", "gemini-2.0-flash"]))
+        dict.fromkeys(
+            filter(None, [GEMINI_MODEL, "gemini-flash-latest", "gemini-3.6-flash"])
+        )
     )
 
     # Os modelos flash atuais "pensam" antes de responder, e o raciocínio consome
@@ -803,6 +934,12 @@ def montar_card(
     total_rs = sum(a["economia_rs"] or 0 for a in analises)
     n_alarmes = sum(len(a["alarmes"]) for a in analises)
     rend_geral = (total_dia / total_kwp) if total_kwp else None
+    total_esperado = sum(a["kwh_esperado"] or 0 for a in analises)
+    # % geral só quando nenhuma usina está com dado parcial
+    if total_esperado and not any(a.get("parcial") for a in analises):
+        pct_geral: float | None = total_dia / total_esperado
+    else:
+        pct_geral = None
 
     if n_alarmes:
         titulo_icone = "🔴"
@@ -821,8 +958,12 @@ def montar_card(
                         "topLabel": (periodo or f"Geração em {dia.strftime('%d/%m')}")
                         + f" — {len(analises)} usina(s)",
                         "text": f"<b>{fmt(total_dia, ' kWh')}</b>"
-                        + (f"  ·  <b>R$ {fmt(total_rs)}</b>" if total_rs else ""),
-                        "bottomLabel": f"{fmt(rend_geral, ' kWh/kWp', 2)} · "
+                        + (f"  ·  <b>R$ {fmt(total_rs)}</b>" if total_rs else "")
+                        + (f"  ·  <b>{pct_geral:.0%}</b> do esperado" if pct_geral else ""),
+                        "bottomLabel": (
+                            f"esperado {fmt(total_esperado, ' kWh')} · " if total_esperado else ""
+                        )
+                        + f"{fmt(rend_geral, ' kWh/kWp', 2)} · "
                         f"{fmt(total_kwp, ' kWp', 0)} instalados · "
                         f"{n_alarmes} alarme(s) ativo(s)",
                     }
@@ -869,9 +1010,29 @@ def montar_card(
                 }
             },
         ]
+        extras: list[dict] = []
+
+        if a["kwh_esperado"]:
+            if a.get("parcial"):
+                # dia em curso: mostra a meta, mas não a % (seria enganosa)
+                texto = f"<b>{fmt(a['kwh_esperado'], ' kWh')}</b> é a meta do dia"
+                rodape = f"{a['base_referencia']} · dia ainda em curso"
+            else:
+                texto = f"<b>{fmt(a['kwh_esperado'], ' kWh')}</b>"
+                if a["atingido"] is not None:
+                    texto += f"  ·  atingiu <b>{a['atingido']:.0%}</b>"
+                rodape = a["base_referencia"]
+                falta = a["kwh_esperado"] - (a["kwh_dia"] or 0)
+                if a["atingido"] is not None and falta > 0:
+                    rodape += f" · faltaram {fmt(falta, ' kWh')}"
+            if a["kwh_historico"]:
+                rodape += f" · média desta usina: {fmt(a['kwh_historico'], ' kWh')}"
+            extras.append(
+                {"decoratedText": {"topLabel": "Esperado", "text": texto, "bottomLabel": rodape}}
+            )
+
         if a["economia_rs"] is not None:
-            linhas.insert(
-                1,
+            extras.append(
                 {
                     "decoratedText": {
                         "topLabel": "Economia estimada",
@@ -879,8 +1040,11 @@ def montar_card(
                         "bottomLabel": f"teto, a R$ {fmt(a['tarifa'], '', 2)}/kWh "
                         "cadastrado na plataforma",
                     }
-                },
+                }
             )
+
+        # ordem: geração do dia → esperado → economia → acumulados → alarmes
+        linhas[1:1] = extras
         for al in a["alarmes"][:5]:
             linhas.append({"textParagraph": {"text": f"⚠️ {descrever_alarme(al)}"}})
         if len(a["alarmes"]) > 5:
@@ -1187,7 +1351,21 @@ def cmd_relatorio() -> int:
                 avisos.append(f"sem dados em tempo real da usina {pid}: {e}")
 
         kwh_ontem, origem, diagnostico = geracao_do_dia(api, pid, dia_ref)
-        a = analisar_usina(u, detalhe, alarmes, cap_cfg, kwh_dia_forcado=kwh_ontem)
+
+        # Calibra o esperado com o histórico da própria usina.
+        kwp_cadastrado = num(pegar(u, CAMPOS_KWP))
+        total_ano = geracao_anual(api, pid, dia_ref.year)
+        anual_por_kwp = (total_ano / kwp_cadastrado) if (total_ano and kwp_cadastrado) else None
+
+        a = analisar_usina(
+            u,
+            detalhe,
+            alarmes,
+            cap_cfg,
+            kwh_dia_forcado=kwh_ontem,
+            anual_por_kwp=anual_por_kwp,
+            mes_ref=dia_ref.month,
+        )
         a["origem_dia"] = origem
         a["parcial"] = False
         a["data_numero"] = dia_ref
@@ -1205,6 +1383,7 @@ def cmd_relatorio() -> int:
                 # Alarme falso diário treina a equipe a ignorar o relatório.
                 a["rotulo"] = "dia em curso, ainda sem julgar"
                 a["icone"] = "🔴" if a["alarmes"] else "⏳"
+                a["atingido"] = None  # % de um dia pela metade não significa nada
                 avisos.append(f"{a['nome']}: {diagnostico}. Mostrando o parcial de hoje.")
             else:
                 a["origem_dia"] = "sem dado"
