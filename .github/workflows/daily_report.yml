@@ -1,0 +1,114 @@
+name: Relatório solar diário
+
+on:
+  schedule:
+    # 10:00 UTC = 07:00 em Brasília (o Brasil não tem mais horário de verão).
+    # O agendador do GitHub costuma atrasar de 5 a 20 min em horários cheios;
+    # se precisar de pontualidade, troque para "45 9 * * *".
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      comando:
+        description: "Subcomando do main.py"
+        type: choice
+        default: relatorio
+        options:
+          - relatorio
+          - descobrir-url
+          - listar-usinas
+          - alarmes
+          - testar-webhook
+      dry_run:
+        description: "Só imprimir o card no log, sem enviar ao Chat"
+        type: boolean
+        default: false
+      debug:
+        description: "Log detalhado das chamadas de API"
+        type: boolean
+        default: false
+
+# Evita dois relatórios concorrentes estourando o limite de 10 req/5 s da API.
+concurrency:
+  group: relatorio-solar
+  cancel-in-progress: false
+
+jobs:
+  relatorio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # main.py usa só a biblioteca padrão — não há pip install nenhum.
+
+      - name: Conferir se os secrets estão cadastrados
+        env:
+          COMANDO: ${{ inputs.comando || 'relatorio' }}
+          AUXSOL_BASE_URL: ${{ secrets.AUXSOL_BASE_URL }}
+          AUXSOL_APP_ID: ${{ secrets.AUXSOL_APP_ID }}
+          AUXSOL_APP_SECRET: ${{ secrets.AUXSOL_APP_SECRET }}
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: |
+          # Cada comando exige só o que realmente usa: assim é possível rodar
+          # descobrir-url sem ainda ter a URL, que é o caso na primeira vez.
+          case "$COMANDO" in
+            descobrir-url)  exigidos="AUXSOL_APP_ID AUXSOL_APP_SECRET" ;;
+            listar-usinas|alarmes) exigidos="AUXSOL_BASE_URL AUXSOL_APP_ID AUXSOL_APP_SECRET" ;;
+            testar-webhook) exigidos="GCHAT_WEBHOOK_URL" ;;
+            *)              exigidos="AUXSOL_BASE_URL AUXSOL_APP_ID AUXSOL_APP_SECRET GCHAT_WEBHOOK_URL" ;;
+          esac
+          faltando=""
+          for v in $exigidos; do
+            if [ -z "${!v}" ]; then faltando="$faltando $v"; fi
+          done
+          if [ -n "$faltando" ]; then
+            echo "::error::Para o comando '$COMANDO' faltam os secrets:$faltando — cadastre em Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Secrets necessários para '$COMANDO' estão presentes: $exigidos"
+
+      - name: Rodar o relatório
+        env:
+          # --- obrigatórios (Secrets) ---
+          AUXSOL_BASE_URL: ${{ secrets.AUXSOL_BASE_URL }}
+          AUXSOL_APP_ID: ${{ secrets.AUXSOL_APP_ID }}
+          AUXSOL_APP_SECRET: ${{ secrets.AUXSOL_APP_SECRET }}
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          # --- opcionais ---
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # PLANT_IDS vazio = todas as usinas visíveis para a credencial.
+          PLANT_IDS: ${{ vars.PLANT_IDS }}
+          CAPACIDADE_KWP: ${{ vars.CAPACIDADE_KWP }}
+          KWH_POR_KWP_ESPERADO: ${{ vars.KWH_POR_KWP_ESPERADO }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          AUXSOL_LANG: ${{ vars.AUXSOL_LANG }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          DEBUG: ${{ inputs.debug && '1' || '' }}
+        run: python main.py ${{ inputs.comando || 'relatorio' }}
+
+      - name: Avisar no Chat se o relatório falhou
+        if: failure()
+        env:
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          EXEC_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$GCHAT_WEBHOOK_URL" ]; then exit 0; fi
+          python - <<'PY'
+          import json, os, urllib.request
+          url = os.environ["GCHAT_WEBHOOK_URL"]
+          corpo = {"text": "⚠️ O relatório solar das 7h falhou hoje. Log da execução: "
+                           + os.environ.get("EXEC_URL", "(sem link)")}
+          req = urllib.request.Request(url, data=json.dumps(corpo).encode(),
+                                       headers={"Content-Type": "application/json"})
+          try:
+              urllib.request.urlopen(req, timeout=20)
+          except Exception as e:
+              print("não conseguiu avisar no Chat:", e)
+          PY
