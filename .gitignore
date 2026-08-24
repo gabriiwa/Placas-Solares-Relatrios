@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .env
 _to_delete/
+
+# dados/ NÃO entra aqui: dados/historico.csv é a segunda cópia do único dado
+# irrecuperável do projeto (a série diária, que a API não guarda). Ignorar essa
+# pasta seria jogar o histórico fora sem aviso.
+# Só os arquivos de teste ficam de fora.
+dados/*_teste.csv

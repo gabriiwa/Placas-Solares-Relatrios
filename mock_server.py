@@ -12,6 +12,19 @@ API AUXSOL falsa + receptor de webhook, para testar o main.py sem credenciais.
 Os números são sintéticos: Tijucas gera bem, Bairro Novo gera fraco e
 Makiolka está parada e com um alarme ativo — dá para ver os três estados
 do card de uma vez. Os SNs dos dataloggers são os reais dos 3 postos.
+
+Também finge a PLANILHA (o Apps Script) em /planilha, para testar a gravação
+do histórico sem tocar no Drive:
+
+  HISTORICO_WEBHOOK_URL=http://127.0.0.1:8899/planilha
+  HISTORICO_WEBHOOK_TOKEN=qualquer-coisa
+
+E imita duas armadilhas reais da API da Nansen:
+
+  · com timeType=2 a série vem por ANO, não por dia (foi a descoberta que
+    mudou o desenho do projeto);
+  · o Tijucas tem 2024 parcial e 2025 NULO — o caso que fazia o card anunciar
+    "média de 40,1 kWh" para uma usina de 100 kWp.
 """
 
 import calendar
@@ -29,7 +42,12 @@ USINAS = [
         "capacity": 100.0,
         "status": "01",
         "dataloggerSn": "A012311030084010",
+        "createTime": "2024-04-26 10:12:00",
+        "meterFlag": 1,
         "perfil": "bom",
+        # o caso venenoso: entrou em operação em 2024 (ano parcial) e 2025 veio
+        # nulo. Sem descartar o ano de entrada, este 2024 vira "o histórico".
+        "historico": {"2024": 41230.0, "2025": None},
     },
     {
         "plantId": 1348,
@@ -37,7 +55,10 @@ USINAS = [
         "capacity": 75.0,
         "status": "01",
         "dataloggerSn": "A012311130984125",
+        "createTime": "2023-09-14 08:30:00",
+        "meterFlag": 1,
         "perfil": "fraco",
+        "historico": {"2024": 54120.0, "2025": 57410.84},
     },
     {
         "plantId": 1460,
@@ -45,11 +66,17 @@ USINAS = [
         "capacity": 75.0,
         "status": "01",
         "dataloggerSn": "A012311130950854",
+        "createTime": "2024-01-30 15:02:00",
+        "meterFlag": 1,
         "perfil": "parada",
+        "historico": {"2024": None, "2025": 43012.5},
     },
 ]
 
 RENDIMENTO = {"bom": 4.4, "fraco": 2.1, "parada": 0.0}
+
+# Campos internos do mock, que a API real não devolveria.
+INTERNOS = ("perfil", "historico")
 
 
 def envelope(dados):
@@ -74,6 +101,14 @@ def serie_mensal(usina):
             }
         )
     return pontos
+
+
+def serie_anual(usina):
+    """Como a API real responde a timeType=2: um ponto por ANO, nulos inclusive."""
+    return [
+        {"dt": ano, "value": valor}
+        for ano, valor in sorted((usina.get("historico") or {}).items())
+    ]
 
 
 def atual(usina):
@@ -103,6 +138,10 @@ ALARMES = [
         "deviceSn": "A012311130950854",
     }
 ]
+
+
+# Planilha falsa: {aba: {chave: linha}}. Só em memória — reiniciar o mock zera.
+PLANILHA = {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -139,6 +178,32 @@ class Handler(BaseHTTPRequestHandler):
             print(json.dumps(corpo, ensure_ascii=False, indent=2))
             print("======================================\n", flush=True)
             return self._responder({"name": "spaces/AAA/messages/BBB"})
+
+        if self.path.startswith("/planilha"):
+            # Imita o Apps Script: mesma regra de substituição por chave, para
+            # que o teste local prove a idempotência antes de ir para o Drive.
+            if not corpo.get("token"):
+                return self._responder({"ok": False, "erro": "token invalido"})
+            aba = corpo.get("aba") or "historico"
+            chave = tuple(corpo.get("chave") or ["data", "plant_id"])
+            guardadas = PLANILHA.setdefault(aba, {})
+            inseridas = atualizadas = 0
+            for linha in corpo.get("linhas") or []:
+                k = tuple(str(linha.get(c, "")) for c in chave)
+                if k in guardadas:
+                    atualizadas += 1
+                else:
+                    inseridas += 1
+                guardadas[k] = linha
+            print(
+                f"  planilha[{aba}] +{inseridas} ~{atualizadas} "
+                f"(total {len(guardadas)})",
+                flush=True,
+            )
+            return self._responder({
+                "ok": True, "inseridas": inseridas,
+                "atualizadas": atualizadas, "total": len(guardadas),
+            })
         self._responder({"code": "AWX-9999", "msg": f"rota desconhecida: {self.path}"}, 404)
 
     def do_GET(self):
@@ -148,7 +213,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/prod-api/archive/plant/list":
             return self._responder(
-                envelope({"total": len(USINAS), "list": [{k: v for k, v in u.items() if k != "perfil"} for u in USINAS]})
+                envelope({
+                    "total": len(USINAS),
+                    "list": [
+                        {k: v for k, v in u.items() if k not in INTERNOS} for u in USINAS
+                    ],
+                })
             )
 
         if p.startswith("/prod-api/analysis/plantReport/queryPlantCurrentData/"):
@@ -176,6 +246,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._responder({"code": "AWX-5003", "msg": "sem permissão de convidado"}, 200)
             if modo == "ruim":
                 return self._responder(envelope({"plantId": u["plantId"], "resumo": "sem série"}))
+
+            # timeType=2 é o que o `geracao_anual` pede — e a API real responde
+            # por ANO, com nulos. Devolver série diária aqui esconderia o bug.
+            if (q.get("timeType") or [""])[0] == "2":
+                return self._responder(envelope([{"dataItem": 6, "data": serie_anual(u)}]))
+
             # formato real da Nansen: uma lista de blocos, um por dataItem
             pontos = serie_mensal(u)
             return self._responder(envelope([
@@ -193,5 +269,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"API falsa da AUXSOL em http://127.0.0.1:{PORTA}/prod-api")
-    print(f"receptor de webhook em  http://127.0.0.1:{PORTA}/gchat\n")
+    print(f"receptor de webhook em  http://127.0.0.1:{PORTA}/gchat")
+    print(f"planilha falsa em       http://127.0.0.1:{PORTA}/planilha\n")
     ThreadingHTTPServer(("127.0.0.1", PORTA), Handler).serve_forever()

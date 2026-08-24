@@ -16,11 +16,13 @@ Só biblioteca padrão: nada de pip install, nada de requirements.txt.
 
 Subcomandos
 -----------
-  python main.py relatorio        # padrão: monta e envia o card
-  python main.py descobrir-url    # testa candidatos de AUXSOL_BASE_URL
-  python main.py listar-usinas    # imprime id / nome / kWp de cada usina
-  python main.py alarmes          # imprime os alarmes crus
-  python main.py testar-webhook   # manda um card de teste pro Google Chat
+  python main.py relatorio         # padrão: monta e envia o card
+  python main.py descobrir-url     # testa candidatos de AUXSOL_BASE_URL
+  python main.py listar-usinas     # imprime id / nome / kWp de cada usina
+  python main.py alarmes           # imprime os alarmes crus
+  python main.py testar-webhook    # manda um card de teste pro Google Chat
+  python main.py testar-historico  # confere o destino do histórico (CSV/planilha)
+  python main.py sondar-series     # existe série diária? existe consumo?
 
 Variáveis de ambiente
 ---------------------
@@ -37,6 +39,13 @@ Variáveis de ambiente
   KWH_POR_KWP_ESPERADO  opcional, padrão 4.2 (referência de dia bom no Sul/PR)
   DRY_RUN             "1" imprime o payload em vez de enviar
   DEBUG               "1" loga cada request/response (sem segredos)
+  HISTORICO_CSV            opcional, ex: dados/historico.csv
+  HISTORICO_WEBHOOK_URL    opcional, URL /exec do Apps Script da planilha
+  HISTORICO_WEBHOOK_TOKEN  segredo combinado com o Apps Script
+  SONDA_PLANT_ID           opcional, qual usina o `sondar-series` usa
+
+Sobre o histórico: a API não guarda série diária, então o dia de hoje só
+existe enquanto o `todayYield` de hoje for hoje. Ver armazenamento.py.
 """
 
 from __future__ import annotations
@@ -443,6 +452,9 @@ CAMPOS_HORAS = ["fullLoadHour", "fullLoadHours", "equivalentHour", "equivalentHo
 CAMPOS_DT = ["dt", "updateTime", "lastUpdateTime", "collectTime", "dataTime"]
 # Tarifa cadastrada na própria plataforma (vem em tariff.fixPrice).
 CAMPOS_TARIFA = ["fixPrice", "unitPrice", "electricityPrice"]
+# Data de cadastro da usina. Serve de piso: ano de entrada em operação é ano
+# parcial, e ano parcial não é histórico.
+CAMPOS_CRIACAO = ["createTime", "createdTime", "buildTime", "gridConnectionTime", "onGridTime"]
 
 # status "01" = normal, confirmado nas 3 usinas em operação. Os outros códigos
 # não foram observados, então não são adivinhados: aparecem crus no card.
@@ -619,11 +631,58 @@ def extrair_serie(rel: Any) -> list[tuple[str, float]]:
     return pontos
 
 
-def geracao_anual(api: "Auxsol", pid: str, ano_atual: int) -> float | None:
+def ano_de_entrada(usina: dict) -> int | None:
+    """
+    Ano do `createTime` da usina. É o piso do histórico utilizável.
+
+    A busca é ANCORADA no começo da string: um `re.search` solto acha "2000"
+    dentro de um timestamp em milissegundos (1717200000000) e devolve um ano
+    que nunca existiu, com cara de ano lido.
+    """
+    bruto = str(pegar(usina, CAMPOS_CRIACAO, "") or "").strip()
+    m = re.match(r"(19|20)\d{2}(?=[-/. ]|$)", bruto)
+    if m:
+        return int(m.group(0))
+    # timestamp em segundos (10 dígitos) ou milissegundos (13)
+    if bruto.isdigit() and len(bruto) in (10, 13):
+        try:
+            segundos = int(bruto) / (1000 if len(bruto) == 13 else 1)
+            return datetime.fromtimestamp(segundos, TZ).year
+        except (ValueError, OSError, OverflowError):
+            return None
+    dbg(f"createTime em formato não reconhecido: {bruto[:40]!r}")
+    return None
+
+
+# Faixa plausível de geração anual por kWp em Curitiba. Um sistema saudável faz
+# 1.300–1.450 kWh/kWp/ano; o pior medido aqui foi 765. Fora de 400–2.000 não é
+# desempenho ruim nem bom: é ano parcial, unidade trocada ou capacidade errada.
+ANUAL_POR_KWP_MIN = 400.0
+ANUAL_POR_KWP_MAX = 2000.0
+
+
+def geracao_anual(
+    api: "Auxsol",
+    pid: str,
+    ano_atual: int,
+    ano_inicio: int | None = None,
+    kwp: float | None = None,
+) -> float | None:
     """
     kWh gerados no último ano COMPLETO. É o que a série anual (a mesma que não
-    servia para o dia) entrega bem — e serve para calibrar o esperado.
-    O ano corrente é ignorado porque está pela metade.
+    servia para o dia) entrega bem — e serve de contexto no card.
+
+    Dois anos são descartados, por motivos diferentes:
+
+      · o ano CORRENTE, porque está pela metade — e isso é óbvio;
+      · o ano de ENTRADA EM OPERAÇÃO (`ano_inicio`, lido do `createTime`),
+        porque também está pela metade — e isso não é óbvio olhando o número.
+
+    O segundo descarte é o bug que este projeto teve: o Posto Tijucas entrou em
+    operação em 2024 e ficou sem 2025 na série, então o "histórico" dele saiu de
+    um 2024 incompleto e o card anunciava média de 40,1 kWh/dia numa usina de
+    100 kWp. Número absurdo com aparência de medição é pior que campo vazio:
+    ninguém desconfia dele.
     """
     try:
         rel = api.serie(pid, "timeType", 2, f"{ano_atual}-01-01")
@@ -637,11 +696,44 @@ def geracao_anual(api: "Auxsol", pid: str, ano_atual: int) -> float | None:
         if len(texto) == 4 and texto.isdigit() and valor > 0:
             anos[int(texto)] = valor
 
-    completos = sorted(a for a in anos if a < ano_atual)
+    completos = sorted(a for a in anos if a < ano_atual and (not ano_inicio or a > ano_inicio))
     if not completos:
+        dbg(
+            f"usina {pid}: nenhum ano completo utilizável (anos com dado: "
+            f"{sorted(anos) or 'nenhum'}; entrada em operação: {ano_inicio}). "
+            "O card sai sem histórico, que é o certo."
+        )
         return None
-    # o mais recente completo: reflete o estado atual da usina melhor que a média
-    return anos[completos[-1]]
+
+    escolhido = anos[completos[-1]]
+
+    # Rede 1: comparação com os outros anos. Um ano muito abaixo dos demais é
+    # quase sempre ano parcial, não ano ruim.
+    if len(completos) > 1:
+        melhor = max(anos[a] for a in completos)
+        if melhor and escolhido < 0.5 * melhor:
+            dbg(
+                f"usina {pid}: {completos[-1]} rendeu {escolhido:.0f} kWh contra "
+                f"{melhor:.0f} kWh do melhor ano completo — parece ano parcial, "
+                "descartado como histórico."
+            )
+            return None
+
+    # Rede 2: plausibilidade física. A rede 1 só funciona com dois anos ou mais,
+    # e o caso que originou o bug tem UM ano só (Tijucas: 2024 parcial, 2025
+    # nulo). Se o createTime também faltar, a rede 1 não pega nada. Esta pega
+    # com um ano só, e é a que impede de novo o "40,1 kWh/dia num 100 kWp".
+    if kwp:
+        por_kwp = escolhido / kwp
+        if not (ANUAL_POR_KWP_MIN <= por_kwp <= ANUAL_POR_KWP_MAX):
+            dbg(
+                f"usina {pid}: {completos[-1]} dá {por_kwp:.0f} kWh/kWp no ano, fora "
+                f"da faixa plausível {ANUAL_POR_KWP_MIN:.0f}–{ANUAL_POR_KWP_MAX:.0f} "
+                "— ano parcial ou capacidade errada, descartado como histórico."
+            )
+            return None
+
+    return escolhido
 
 
 def analisar_usina(
@@ -1284,6 +1376,19 @@ def cmd_testar_webhook() -> int:
 
 def cmd_relatorio() -> int:
     exigir("AUXSOL_BASE_URL", "AUXSOL_APP_ID", "AUXSOL_APP_SECRET")
+
+    # Sem fuso, `agora()` cai em hora local do runner, que é UTC. Rodando à 01h
+    # UTC (22h de Brasília), a data do relatório viraria o DIA SEGUINTE e todas
+    # as linhas sairiam marcadas como parciais — o histórico inteiro arquivado
+    # na data errada, sem nada indicando o problema. Preferimos parar: falha
+    # visível é recuperável, dado silenciosamente errado não é.
+    if TZ is None:
+        raise RuntimeError(
+            "não foi possível carregar o fuso America/Sao_Paulo (zoneinfo/tzdata "
+            "ausente). Sem ele a data de cada linha do histórico sairia errada. "
+            "Instale o pacote tzdata (`pip install tzdata`) e rode de novo."
+        )
+
     avisos: list[str] = []
     api = Auxsol(BASE_URL, APP_ID, APP_SECRET)
 
@@ -1333,7 +1438,9 @@ def cmd_relatorio() -> int:
 
         # Histórico anual: é o que este endpoint entrega bem, e serve de contexto.
         kwp_cadastrado = num(pegar(u, CAMPOS_KWP))
-        total_ano = geracao_anual(api, pid, dia_ref.year)
+        total_ano = geracao_anual(
+            api, pid, dia_ref.year, ano_de_entrada(u), kwp=kwp_cadastrado
+        )
         anual_por_kwp = (total_ano / kwp_cadastrado) if (total_ano and kwp_cadastrado) else None
 
         a = analisar_usina(
@@ -1384,8 +1491,325 @@ def cmd_relatorio() -> int:
         periodo = "Geração — datas diferentes por usina"
         subtitulo = f"{dia_ref.strftime('%d/%m/%Y')} · leia a data de cada usina"
 
+    # --- histórico ---------------------------------------------------------- #
+    # ANTES de enviar o card, de propósito. O card é reproduzível: se falhar,
+    # roda de novo. A leitura de hoje não é: `todayYield` é um instantâneo e
+    # amanhã já é outro número. Entre perder o card e perder o dia de histórico,
+    # perde-se o card.
+    if DRY_RUN:
+        log("histórico: DRY_RUN, nada gravado (use `testar-historico` para testar o destino)")
+    else:
+        try:
+            import armazenamento
+
+            for ok, msg in armazenamento.gravar(analises, agora_.isoformat(timespec="seconds")):
+                log(("histórico: " if not msg.startswith("histórico") else "") + msg)
+                # Qualquer resultado que NÃO seja gravação confirmada vai para o
+                # card, não só para o log. Um histórico que para de gravar em
+                # silêncio é pior que um que nunca existiu: o dashboard continua
+                # abrindo, com os dados congelados, e ninguém desconfia por
+                # semanas. O `ok` vem do armazenamento justamente para não
+                # depender de procurar palavra em texto.
+                if not ok:
+                    avisos.append(msg)
+        except ImportError:
+            avisos.append("armazenamento.py não encontrado — o dia de hoje não foi guardado.")
+        except Exception as e:  # defesa extra: gravar() já não levanta
+            avisos.append(f"falha inesperada ao gravar o histórico: {e}")
+
     card = montar_card(analises, comentario_ia(analises), avisos, dia_ref, periodo, subtitulo)
     enviar_chat(card)
+    return 0
+
+
+def cmd_testar_historico() -> int:
+    """
+    Confere o destino do histórico sem esperar o job da noite e sem sujar os
+    dados reais: grava uma linha marcada numa aba/arquivo `teste`.
+    """
+    import armazenamento
+
+    destinos = armazenamento.destinos_configurados()
+    if not destinos:
+        log(
+            "nenhum destino configurado.\n"
+            "  HISTORICO_CSV=dados/historico.csv           grava num arquivo local\n"
+            "  HISTORICO_WEBHOOK_URL=https://…/exec        grava na planilha do Google\n"
+            "  HISTORICO_WEBHOOK_TOKEN=…                   o mesmo segredo do Apps Script"
+        )
+        return 1
+
+    log(f"destinos configurados: {', '.join(destinos)}")
+    falhou = False
+    for ok, msg in armazenamento.testar_destinos(agora().isoformat(timespec="seconds")):
+        log(f"  {'ok   ' if ok else 'FALHA'} {msg}")
+        if not ok:
+            falhou = True
+
+    if falhou:
+        log(
+            "\nLeitura das falhas mais comuns:\n"
+            "  · 'token invalido'  = o TOKEN do Apps Script não é o do secret\n"
+            "  · HTTP 401/403      = a implantação não está como 'Qualquer pessoa'\n"
+            "  · HTTP 404          = a URL não termina em /exec, ou a implantação foi apagada\n"
+            "  · resposta em HTML  = o Apps Script deu erro; veja Execuções no editor"
+        )
+        return 1
+
+    log("\nok. Apague a aba/arquivo `teste` quando quiser — nada real foi tocado.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# sondagem: existe série diária? existe consumo?
+# --------------------------------------------------------------------------- #
+
+# Rótulos temporais dizem a granularidade que a API decidiu devolver. "2025" é
+# ano, "2025-07" é mês, "2025-07-14" é dia, "14:30" é ponto de curva.
+def _granularidade(rotulo: Any) -> str:
+    t = str(rotulo).strip()
+    if re.fullmatch(r"\d{4}", t):
+        return "ano"
+    if re.fullmatch(r"\d{4}[-/]\d{1,2}", t) or re.fullmatch(r"\d{1,2}", t):
+        return "mês"
+    if re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", t):
+        return "DIA"
+    if ":" in t:
+        return "hora"
+    return f"?({t[:12]})"
+
+
+def _resumir_blocos(rel: Any) -> tuple[str, dict[Any, int], str]:
+    """
+    (granularidade vista, {dataItem: pontos com valor}, faixa de rótulos).
+
+    A faixa é o que decide se dá para fazer backfill: uma resposta com
+    2024-05-01..2024-05-31 significa que a API aceita voltar no tempo; uma que
+    devolve sempre o mês corrente, não.
+    """
+    if not isinstance(rel, list) or not rel:
+        return f"resposta não é lista de blocos: {str(rel)[:80]}", {}, ""
+
+    granularidades: list[str] = []
+    contagem: dict[Any, int] = {}
+    rotulos_maior: list[str] = []
+    for bloco in rel:
+        if not isinstance(bloco, dict):
+            continue
+        item = bloco.get("dataItem", "?")
+        pontos = bloco.get("data") if isinstance(bloco.get("data"), list) else []
+        rotulos: list[str] = []
+        for p in pontos:
+            if not isinstance(p, dict):
+                continue
+            if num(pegar(p, CAMPOS_VALOR_SERIE)) is not None:
+                rot = pegar(p, CAMPOS_DATA_SERIE)
+                if rot not in (None, ""):
+                    granularidades.append(_granularidade(rot))
+                    rotulos.append(str(rot))
+        contagem[item] = len(rotulos)
+        if len(rotulos) > len(rotulos_maior):
+            rotulos_maior = rotulos
+
+    vistas = sorted(dict.fromkeys(granularidades))
+    faixa = ""
+    if rotulos_maior:
+        ordenados = sorted(rotulos_maior)
+        faixa = (
+            ordenados[0] if len(ordenados) == 1 else f"{ordenados[0]}..{ordenados[-1]}"
+        )
+    return (("/".join(vistas) if vistas else "sem pontos com valor"), contagem, faixa)
+
+
+def cmd_sondar_series() -> int:
+    """
+    Responde duas perguntas que decidem o desenho do dashboard — e que não
+    devem ser respondidas de memória:
+
+      1. EXISTE série diária nesta API? Se existir, dá para recuperar o
+         histórico desde 2024 em vez de começar a contar de hoje.
+      2. Os dataItems de consumo (7 comprado, 8 injetado, 11 consumo da carga,
+         12 autoconsumo) devolvem dado? As 3 usinas têm `meterFlag: 1`, o que
+         sugere medidor instalado. Se devolverem, a economia deixa de ser um
+         teto estimado e passa a ser o número real — que é o objetivo original
+         do projeto (economia × parcela do financiamento).
+
+    A sondagem anterior variou timeType/dateType sempre pedindo os MESMOS
+    dataItems de energia. Aqui o bitmask também varia, porque é plausível que
+    seja ele — e não o timeType — quem define a granularidade: os bits 0–5 são
+    documentados como curva do dia em kW, e nunca foram pedidos.
+
+    Custa ~30 chamadas numa usina só, com o mesmo throttle do relatório.
+    """
+    exigir("AUXSOL_BASE_URL", "AUXSOL_APP_ID", "AUXSOL_APP_SECRET")
+    api = Auxsol(BASE_URL, APP_ID, APP_SECRET)
+
+    usinas = api.usinas()
+    if not usinas:
+        raise RuntimeError("a API não devolveu nenhuma usina para esta credencial.")
+
+    escolhido = (os.environ.get("SONDA_PLANT_ID") or "").strip()
+    alvo = next((u for u in usinas if str(pegar(u, CAMPOS_ID, "")) == escolhido), usinas[0])
+    pid = str(pegar(alvo, CAMPOS_ID, ""))
+    nome = limpar_nome(str(pegar(alvo, CAMPOS_NOME, "")))
+    log(f"sondando a usina {pid} ({nome}); as outras entram só no dump anual.\n")
+
+    hoje = agora().date()
+    # Um mês JÁ FECHADO: se a API tem série diária, aqui ela está completa.
+    ref = (hoje.replace(day=1) - timedelta(days=1)).replace(day=15)
+    ano = hoje.year
+
+    GERACAO = 1 << 6
+    TODOS_ENERGIA = DATA_ITEMS_ENERGIA
+    CURVA_DIA = (1 << 6) - 1  # bits 0..5, a curva de potência do dia
+    TUDO = (1 << 14) - 1
+
+    experimentos: list[tuple[str, dict]] = []
+
+    # 1. o timeType manda na granularidade? (pedindo só geração)
+    for t in (1, 2, 3, 4, 5):
+        experimentos.append(
+            (f"timeType={t}", {"plantId": pid, "timeType": t,
+                               "queryTime": ref.isoformat(), "dataItems": GERACAO})
+        )
+    # 2. e o dateType?
+    for d in (1, 2, 3, 4):
+        experimentos.append(
+            (f"dateType={d}", {"plantId": pid, "dateType": d,
+                               "queryTime": ref.isoformat(), "dataItems": GERACAO})
+        )
+    # 3. o parâmetro pode ter outro nome — o framework tem vários dialetos
+    for chave in ("type", "reportType", "granularity", "dimension", "timeDim", "queryType"):
+        experimentos.append(
+            (f"{chave}=1", {"plantId": pid, chave: 1,
+                            "queryTime": ref.isoformat(), "dataItems": GERACAO})
+        )
+    # 4. o BITMASK é que manda? bits 0..5 nunca foram pedidos
+    for bit in range(6):
+        experimentos.append(
+            (f"dataItems=bit{bit}", {"plantId": pid, "timeType": 1,
+                                     "queryTime": ref.isoformat(), "dataItems": 1 << bit})
+        )
+    experimentos.append(
+        ("dataItems=curva do dia (bits 0-5)",
+         {"plantId": pid, "timeType": 1, "queryTime": ref.isoformat(), "dataItems": CURVA_DIA})
+    )
+    # 5. formato do queryTime
+    for fmt_ in (ref.strftime("%Y-%m"), ref.strftime("%Y%m%d"),
+                 ref.strftime("%Y-%m-%d %H:%M:%S"), str(ano)):
+        experimentos.append(
+            (f"queryTime={fmt_}", {"plantId": pid, "timeType": 1,
+                                   "queryTime": fmt_, "dataItems": GERACAO})
+        )
+    # 6. sem nenhum parâmetro de granularidade
+    experimentos.append(
+        ("só plantId+queryTime", {"plantId": pid, "queryTime": ref.isoformat(),
+                                  "dataItems": GERACAO})
+    )
+    # 7. TODOS os bits: mostra quais séries a credencial de convidado enxerga
+    experimentos.append(
+        ("dataItems=todos os 14 bits", {"plantId": pid, "timeType": 2,
+                                        "queryTime": f"{ano}-01-01", "dataItems": TUDO})
+    )
+
+    achados_dia: list[tuple[str, str]] = []
+    itens_com_dado: dict[Any, int] = {}
+
+    for rotulo, params in experimentos:
+        try:
+            rel = api.get("/analysis/plantReport/queryPlantReportByPlantId", params)
+        except Exception as e:
+            log(f"  {rotulo:38s} ERRO {str(e)[:90]}")
+            continue
+
+        granul, contagem, faixa = _resumir_blocos(rel)
+        resumo = ", ".join(f"{k}:{v}" for k, v in sorted(contagem.items(), key=lambda x: str(x[0])))
+        log(f"  {rotulo:38s} {granul:10s} {faixa:26s} itens -> {resumo or 'nenhum'}")
+
+        if "DIA" in granul or "hora" in granul:
+            # Agrupado pela ASSINATURA da resposta: quando 25 combinações
+            # devolvem a mesma coisa, listar as 25 esconde a informação.
+            achados_dia.append((f"{granul} {faixa}", rotulo))
+        for k, v in contagem.items():
+            if v:
+                itens_com_dado[k] = max(itens_com_dado.get(k, 0), v)
+
+    # 8. dump anual cru de cada usina: é aqui que se vê o ano nulo do Tijucas
+    log("\nSérie anual crua, usina por usina (timeType=2, todos os bits de energia):")
+    for u in usinas:
+        upid = str(pegar(u, CAMPOS_ID, ""))
+        unome = limpar_nome(str(pegar(u, CAMPOS_NOME, "")))
+        criado = pegar(u, CAMPOS_CRIACAO, "?")
+        try:
+            rel = api.get(
+                "/analysis/plantReport/queryPlantReportByPlantId",
+                {"plantId": upid, "timeType": 2, "queryTime": f"{ano}-01-01",
+                 "dataItems": TODOS_ENERGIA},
+            )
+        except Exception as e:
+            log(f"  {unome} ({upid}) ERRO {str(e)[:100]}")
+            continue
+
+        log(f"  {unome} ({upid}) — cadastrada em {criado}, entrada em {ano_de_entrada(u)}")
+        for bloco in rel if isinstance(rel, list) else []:
+            if not isinstance(bloco, dict):
+                continue
+            pontos = bloco.get("data") if isinstance(bloco.get("data"), list) else []
+            # inclusive os nulos: "2025: null" é informação, e foi o que fez o
+            # histórico do Tijucas sair de um ano incompleto
+            crus = ", ".join(
+                f"{pegar(p, CAMPOS_DATA_SERIE)}={pegar(p, CAMPOS_VALOR_SERIE)}"
+                for p in pontos if isinstance(p, dict)
+            )
+            log(f"      dataItem {bloco.get('dataItem')}: {crus or '(vazio)'}")
+
+    # --- veredito ---------------------------------------------------------- #
+    log("\n" + "=" * 70)
+    if achados_dia:
+        por_assinatura: dict[str, list[str]] = {}
+        for assinatura, rotulo in achados_dia:
+            por_assinatura.setdefault(assinatura, []).append(rotulo)
+        log(
+            f"SÉRIE DIÁRIA: EXISTE — {len(achados_dia)} de {len(experimentos)} "
+            "combinações devolveram dia ou hora."
+        )
+        for assinatura, rotulos in por_assinatura.items():
+            log(f"  · {assinatura}")
+            log(f"      via: {', '.join(rotulos[:6])}{' …' if len(rotulos) > 6 else ''}")
+        log(
+            "\nConsequência: se a faixa acima acompanha o queryTime que pedimos,\n"
+            "dá para recarregar o histórico desde a entrada em operação em vez de\n"
+            "começar a contar de hoje. Confira a faixa antes de comemorar: uma API\n"
+            "que devolve sempre o mês corrente, qualquer que seja o queryTime,\n"
+            "parece ter série histórica e não tem."
+        )
+    else:
+        log(
+            f"SÉRIE DIÁRIA: não apareceu em {len(experimentos)} combinações.\n"
+            "Confirma a conclusão anterior: o histórico diário só existe se nós\n"
+            "gravarmos. Cada noite sem gravar é um dia que não volta."
+        )
+
+    consumo = {7: "comprado da rede", 8: "injetado", 11: "consumo da carga", 12: "autoconsumo"}
+    vieram = {k: v for k, v in itens_com_dado.items() if k in consumo}
+    log("")
+    if vieram:
+        log("CONSUMO/INJEÇÃO: vieram com dado —")
+        for k, v in sorted(vieram.items(), key=lambda x: str(x[0])):
+            log(f"  · dataItem {k} ({consumo[k]}): {v} ponto(s)")
+        log(
+            "\nConsequência: a economia pode deixar de ser 'teto' e virar o valor\n"
+            "real (autoconsumo × tarifa cheia + injetado × tarifa de compensação),\n"
+            "que é o que se compara com a parcela do financiamento."
+        )
+    else:
+        log(
+            "CONSUMO/INJEÇÃO: nenhum dado, apesar do meterFlag: 1 nas três usinas.\n"
+            "Provável restrição da credencial de convidado (isVisitor: true) — vale\n"
+            "pedir à Nansen uma credencial de proprietário antes de desistir.\n"
+            "Até lá a economia continua sendo teto, e o card precisa dizer isso."
+        )
+    log("=" * 70)
     return 0
 
 
@@ -1450,6 +1874,8 @@ COMANDOS = {
     "listar-usinas": cmd_listar_usinas,
     "alarmes": cmd_alarmes,
     "testar-webhook": cmd_testar_webhook,
+    "testar-historico": cmd_testar_historico,
+    "sondar-series": cmd_sondar_series,
 }
 
 
