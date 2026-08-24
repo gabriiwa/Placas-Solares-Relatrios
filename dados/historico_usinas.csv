@@ -1,0 +1,4 @@
+plant_id,usina,kwp,tarifa_rs_kwh,status,atualizado_em,coletado_em
+1348,Posto Bairro Novo,75.0,0.87,normal,2026-08-24 14:50:44,2026-08-24T14:57:26-03:00
+1408,Posto Tijucas,100.0,0.87,normal,2026-08-24 14:50:27,2026-08-24T14:57:26-03:00
+1460,Posto Makiolka,75.0,0.87,status 02,2026-08-24 11:51:34,2026-08-24T14:57:26-03:00
