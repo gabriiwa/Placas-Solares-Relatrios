@@ -2,9 +2,15 @@ name: Relatório solar diário
 
 on:
   schedule:
-    # 10:00 UTC = 07:00 em Brasília (o Brasil não tem mais horário de verão).
-    # O agendador do GitHub costuma atrasar de 5 a 20 min em horários cheios;
-    # se precisar de pontualidade, troque para "45 9 * * *".
+    # 01:00 UTC = 22:00 em Brasília (o Brasil não tem mais horário de verão).
+    #
+    # POR QUE 22h E NÃO 7h: a API não tem série diária. O único número do dia é
+    # o `todayYield`, que é um instantâneo — às 7h a geração de hoje é zero e o
+    # card sairia "sem geração" toda manhã. Depois do pôr do sol o dia está
+    # fechado e o número é o total real do dia. É também o número que vai para o
+    # histórico, então o horário decide a qualidade do dado guardado.
+    #
+    # O agendador do GitHub costuma atrasar de 5 a 20 min em horários cheios.
     - cron: "0 1 * * *"
   workflow_dispatch:
     inputs:
@@ -18,8 +24,11 @@ on:
           - listar-usinas
           - alarmes
           - testar-webhook
+          - testar-gemini
+          - testar-historico
+          - sondar-series
       dry_run:
-        description: "Só imprimir o card no log, sem enviar ao Chat"
+        description: "Só imprimir o card no log, sem enviar ao Chat (e sem gravar histórico)"
         type: boolean
         default: false
       debug:
@@ -32,10 +41,18 @@ concurrency:
   group: relatorio-solar
   cancel-in-progress: false
 
+# Necessário para o passo que comita o CSV de histórico de volta no repositório.
+permissions:
+  contents: write
+
 jobs:
   relatorio:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 25 e não 15: no pior caso (API pendurada, não recusando) as tentativas do
+    # http() somam uns 13 minutos ANTES de chegar à gravação do histórico. Um
+    # timeout apertado mata o job justamente entre ler o dado e guardá-lo, e o
+    # dia se perde. A sondagem, que é o comando mais longo, leva ~2 min.
+    timeout-minutes: 25
 
     steps:
       - name: Baixar o repositório
@@ -55,13 +72,15 @@ jobs:
           AUXSOL_APP_ID: ${{ secrets.AUXSOL_APP_ID }}
           AUXSOL_APP_SECRET: ${{ secrets.AUXSOL_APP_SECRET }}
           GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          HISTORICO_WEBHOOK_URL: ${{ secrets.HISTORICO_WEBHOOK_URL }}
         run: |
           # Cada comando exige só o que realmente usa: assim é possível rodar
           # descobrir-url sem ainda ter a URL, que é o caso na primeira vez.
           case "$COMANDO" in
             descobrir-url)  exigidos="AUXSOL_APP_ID AUXSOL_APP_SECRET" ;;
-            listar-usinas|alarmes) exigidos="AUXSOL_BASE_URL AUXSOL_APP_ID AUXSOL_APP_SECRET" ;;
+            listar-usinas|alarmes|sondar-series) exigidos="AUXSOL_BASE_URL AUXSOL_APP_ID AUXSOL_APP_SECRET" ;;
             testar-webhook) exigidos="GCHAT_WEBHOOK_URL" ;;
+            testar-historico) exigidos="HISTORICO_WEBHOOK_URL" ;;
             *)              exigidos="AUXSOL_BASE_URL AUXSOL_APP_ID AUXSOL_APP_SECRET GCHAT_WEBHOOK_URL" ;;
           esac
           faltando=""
@@ -81,6 +100,13 @@ jobs:
           AUXSOL_APP_ID: ${{ secrets.AUXSOL_APP_ID }}
           AUXSOL_APP_SECRET: ${{ secrets.AUXSOL_APP_SECRET }}
           GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          # --- histórico (o dado que a API não guarda) ---
+          # A planilha é o destino que o Power BI lê. O CSV abaixo é a segunda
+          # cópia, versionada no próprio repositório: são dois destinos porque
+          # este dado não pode ser recuperado se for perdido.
+          HISTORICO_WEBHOOK_URL: ${{ secrets.HISTORICO_WEBHOOK_URL }}
+          HISTORICO_WEBHOOK_TOKEN: ${{ secrets.HISTORICO_WEBHOOK_TOKEN }}
+          HISTORICO_CSV: dados/historico.csv
           # --- opcionais ---
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # PLANT_IDS vazio = todas as usinas visíveis para a credencial.
@@ -89,9 +115,51 @@ jobs:
           KWH_POR_KWP_ESPERADO: ${{ vars.KWH_POR_KWP_ESPERADO }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           AUXSOL_LANG: ${{ vars.AUXSOL_LANG }}
+          SONDA_PLANT_ID: ${{ vars.SONDA_PLANT_ID }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           DEBUG: ${{ inputs.debug && '1' || '' }}
         run: python main.py ${{ inputs.comando || 'relatorio' }}
+
+      - name: Guardar o CSV de histórico no repositório
+        # Segunda cópia do único dado irrecuperável do projeto. Roda mesmo se o
+        # passo anterior falhou depois de gravar (if: always() com o arquivo
+        # existindo), porque uma linha gravada e não comitada é uma linha
+        # perdida.
+        if: always() && !inputs.dry_run
+        run: |
+          if [ ! -f dados/historico.csv ]; then
+            echo "sem dados/historico.csv nesta execução — nada a comitar"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dados/
+          if git diff --cached --quiet; then
+            echo "histórico sem mudança — nada a comitar"
+            exit 0
+          fi
+          # Data LOCAL: o job roda às 22h de Brasília, que é 01h UTC do dia
+          # seguinte. Com `date -u` toda mensagem de commit ficaria um dia à
+          # frente da linha que ela contém.
+          git commit -m "histórico: leitura de $(TZ=America/Sao_Paulo date +%Y-%m-%d)"
+          # Empurrar com repetição: se alguém comitar entre o rebase e o push, o
+          # push é recusado e sem repetição a linha do dia ficaria só na planilha
+          # — e o CSV, que existe para ser a segunda cópia, nasceria com furo.
+          for tentativa in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || {
+              echo "::warning::rebase falhou (conflito em dados/?) — abortando e tentando de novo"
+              git rebase --abort || true
+              sleep $((tentativa * 5))
+              continue
+            }
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "histórico comitado na tentativa $tentativa"
+              exit 0
+            fi
+            sleep $((tentativa * 5))
+          done
+          echo "::error::não consegui comitar o CSV de histórico. A planilha (que o Power BI lê) provavelmente recebeu a linha — confira antes de assumir perda."
+          exit 1
 
       - name: Avisar no Chat se o relatório falhou
         if: failure()
@@ -103,7 +171,7 @@ jobs:
           python - <<'PY'
           import json, os, urllib.request
           url = os.environ["GCHAT_WEBHOOK_URL"]
-          corpo = {"text": "⚠️ O relatório solar das 7h falhou hoje. Log da execução: "
+          corpo = {"text": "⚠️ O relatório solar das 22h falhou hoje. Log da execução: "
                            + os.environ.get("EXEC_URL", "(sem link)")}
           req = urllib.request.Request(url, data=json.dumps(corpo).encode(),
                                        headers={"Content-Type": "application/json"})
