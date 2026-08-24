@@ -44,7 +44,7 @@
  * de criar uma segunda — senão qualquer soma no Power BI sairia dobrada.
  */
 
-var TOKEN = 'TROQUE-ISTO-POR-UM-SEGREDO-LONGO';
+var TOKEN = '4c23a81af18e0d49ea9795fdb94b6f204ae9090ac028ec88';
 
 function doPost(e) {
   var trava = LockService.getScriptLock();
