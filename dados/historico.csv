@@ -1,4 +1,4 @@
 data,plant_id,usina,kwp,kwh_dia,kwh_por_kwp,kwh_esperado,pct_atingido,kwh_mes,kwh_total,tarifa_rs_kwh,economia_dia_rs,economia_mes_rs,status,parcial,alarmes,base_referencia,coletado_em
-2026-08-24,1348,Posto Bairro Novo,75.0,221.12,2.948,258.0,,5335.91,205275.51,0.87,192.37,4642.24,normal,1,0,referência regional,2026-08-24T14:57:26-03:00
-2026-08-24,1408,Posto Tijucas,100.0,152.0,1.52,344.0,,2387.73,132349.24,0.87,132.24,2077.33,normal,1,0,referência regional,2026-08-24T14:57:26-03:00
-2026-08-24,1460,Posto Makiolka,75.0,45.42,0.606,258.0,,2959.26,124102.08,0.87,39.52,2574.56,status 02,1,0,referência regional,2026-08-24T14:57:26-03:00
+2026-08-24,1348,Posto Bairro Novo,75.0,282.96,3.773,258.0,1.0967,5397.73,205337.35,0.87,246.18,4696.03,status 02,0,0,referência regional,2026-08-24T23:10:19-03:00
+2026-08-24,1408,Posto Tijucas,100.0,189.05,1.891,344.0,0.5496,2424.77,132386.47,0.87,164.47,2109.55,status 02,0,0,referência regional,2026-08-24T23:10:19-03:00
+2026-08-24,1460,Posto Makiolka,75.0,73.83,0.984,258.0,0.2862,2987.67,124130.49,0.87,64.23,2599.27,status 02,0,0,referência regional,2026-08-24T23:10:19-03:00
