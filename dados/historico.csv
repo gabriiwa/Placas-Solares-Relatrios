@@ -83,3 +83,6 @@ data,plant_id,usina,kwp,kwh_dia,kwh_por_kwp,kwh_esperado,pct_atingido,kwh_mes,kw
 2026-09-21,1348,Posto Bairro Novo,75.0,,,252.0,,4207.42,211041.68,0.87,,3660.46,status 02,1,0,referência regional,2026-09-21T02:35:22-03:00
 2026-09-21,1408,Posto Tijucas,100.0,,,336.0,,2820.06,136212.69,0.87,,2453.45,status 02,1,0,referência regional,2026-09-21T02:35:22-03:00
 2026-09-21,1460,Posto Makiolka,75.0,,,252.0,,2657.67,127701.08,0.87,,2312.17,status 02,1,0,referência regional,2026-09-21T02:35:22-03:00
+2026-09-22,1348,Posto Bairro Novo,75.0,,,252.0,,4586.19,211420.45,0.87,,3989.99,status 02,1,0,referência regional,2026-09-22T02:31:53-03:00
+2026-09-22,1408,Posto Tijucas,100.0,,,336.0,,3098.52,136492.54,0.87,,2695.71,status 02,1,0,referência regional,2026-09-22T02:31:53-03:00
+2026-09-22,1460,Posto Makiolka,75.0,,,252.0,,2924.85,127968.26,0.87,,2544.62,status 02,1,0,referência regional,2026-09-22T02:31:53-03:00
